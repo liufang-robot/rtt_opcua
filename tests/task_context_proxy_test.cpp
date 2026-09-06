@@ -1,7 +1,9 @@
+#define BOOST_TEST_NO_MAIN
 #define BOOST_TEST_MODULE rtt_opcua_task_context_proxy
 #include <boost/test/included/unit_test.hpp>
 
 #include "custom_datatype_test_support.hpp"
+#include "rtt_test_thread.hpp"
 
 #include <rtt/opcua/node_id.hpp>
 #include <rtt/opcua/object_model.hpp>
@@ -1190,6 +1192,7 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   std::barrier synchronize_start(
       static_cast<std::ptrdiff_t>(synchronize_count));
   std::array<bool, synchronize_count> synchronized{};
+  std::array<int, synchronize_count> thread_initialization_results{};
   std::array<std::string, synchronize_count> synchronize_errors;
   std::vector<std::jthread> synchronizers;
   synchronizers.reserve(synchronize_count);
@@ -1205,13 +1208,21 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   });
   for (std::size_t index = 0; index < synchronize_count; ++index) {
     synchronizers.emplace_back([&, index] {
+      thread_initialization_results[index] =
+          RTT::opcua::test::initializeRttThreadContext();
       synchronize_start.arrive_and_wait();
-      synchronized[index] = proxy->synchronize(&synchronize_errors[index]);
+      if (thread_initialization_results[index] == 0) {
+        synchronized[index] = proxy->synchronize(&synchronize_errors[index]);
+      }
     });
   }
   synchronizers.clear();
   control_caller.join();
   for (std::size_t index = 0; index < synchronize_count; ++index) {
+    BOOST_REQUIRE_MESSAGE(
+        thread_initialization_results[index] == 0,
+        "failed to initialize RTT worker thread: "
+            << thread_initialization_results[index]);
     BOOST_TEST(synchronized[index], synchronize_errors[index]);
   }
   BOOST_TEST(control_calls_succeeded.load());

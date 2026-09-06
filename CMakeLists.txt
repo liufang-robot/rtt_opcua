@@ -97,6 +97,7 @@ if(BUILD_TESTING)
   add_executable(
     rtt_opcua_datatype_registry_test
     tests/datatype_registry_test.cpp
+    tests/rtt_test_main.cpp
   )
   target_link_libraries(
     rtt_opcua_datatype_registry_test
@@ -183,6 +184,7 @@ if(BUILD_TESTING)
   add_test(NAME rtt_opcua_server_test COMMAND rtt_opcua_server_test)
 
   add_executable(rtt_opcua_type_protocol_test tests/type_protocol_test.cpp)
+  target_sources(rtt_opcua_type_protocol_test PRIVATE tests/rtt_test_main.cpp)
   target_link_libraries(
     rtt_opcua_type_protocol_test
     orocos-rtt-opcua
@@ -199,6 +201,7 @@ if(BUILD_TESTING)
   add_test(NAME rtt_opcua_type_protocol_test COMMAND rtt_opcua_type_protocol_test)
 
   add_executable(rtt_opcua_object_model_test tests/object_model_test.cpp)
+  target_sources(rtt_opcua_object_model_test PRIVATE tests/rtt_test_main.cpp)
   target_link_libraries(
     rtt_opcua_object_model_test
     PRIVATE
@@ -216,6 +219,7 @@ if(BUILD_TESTING)
   set_tests_properties(rtt_opcua_object_model_test PROPERTIES TIMEOUT 30)
 
   add_executable(rtt_opcua_task_context_proxy_test tests/task_context_proxy_test.cpp)
+  target_sources(rtt_opcua_task_context_proxy_test PRIVATE tests/rtt_test_main.cpp)
   target_link_libraries(
     rtt_opcua_task_context_proxy_test
     PRIVATE
