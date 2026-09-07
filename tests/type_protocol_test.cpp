@@ -1,3 +1,4 @@
+#define BOOST_TEST_NO_MAIN
 #define BOOST_TEST_MODULE rtt_opcua_type_protocol
 #include <boost/test/included/unit_test.hpp>
 
