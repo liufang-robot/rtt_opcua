@@ -223,7 +223,7 @@ public:
       return PortValueStatus::error;
     }
     FixtureValue sample;
-    if (!typed->getLastWrittenValue(sample)) {
+    if (!typed->snapshot(sample)) {
       return PortValueStatus::waiting_for_initial_data;
     }
     *value = ::opcua::Variant(sample, *native_type_);

@@ -1,4 +1,5 @@
 #include "port_bridge.hpp"
+#include <rtt/internal/PortDataAccess.hpp>
 
 #include <rtt/opcua/endpoint_type_registry.hpp>
 
@@ -100,7 +101,9 @@ PortBridge::write(const ::opcua::Variant &encoded) noexcept {
     if (!value) {
       return UA_STATUSCODE_BADTYPEMISMATCH;
     }
-    switch (output->write(value)) {
+    // The anti-port owns this transport channel. Network ingress never edits
+    // the component input image; the owner's next cycle acquires the sample.
+    switch (RTT::internal::PortDataAccess::publish(*output, value)) {
     case RTT::WriteSuccess:
       return UA_STATUSCODE_GOOD;
     case RTT::NotConnected:

@@ -1,3 +1,4 @@
+#include <rtt/internal/PortDataAccess.hpp>
 #define BOOST_TEST_MODULE rtt_opcua_type_protocol
 #include <boost/test/included/unit_test.hpp>
 
@@ -120,7 +121,7 @@ void exerciseArrayCodec(std::string_view type_name,
              boost::test_tools::per_element());
 
   RTT::OutputPort<std::vector<T>> port("values");
-  port.write(initial);
+  RTT::internal::PortDataAccess::publish(port, initial);
   ::opcua::Variant port_value;
   BOOST_CHECK(codec->portValue(&port, &port_value) ==
               RTT::opcua::PortValueStatus::value);
@@ -308,7 +309,7 @@ BOOST_AUTO_TEST_CASE(task_state_protocol_is_a_strict_bounded_int32_scalar) {
     BOOST_TEST(static_cast<std::int32_t>(typed->get()) == code);
 
     RTT::OutputPort<TaskState> port("state");
-    port.write(state);
+    RTT::internal::PortDataAccess::publish(port, state);
     ::opcua::Variant port_value;
     BOOST_CHECK(codec->portValue(&port, &port_value) ==
                 RTT::opcua::PortValueStatus::value);
@@ -364,7 +365,7 @@ BOOST_AUTO_TEST_CASE(task_state_protocol_is_a_strict_bounded_int32_scalar) {
   }
 
   RTT::OutputPort<TaskState> invalid_port("invalid-state");
-  invalid_port.write(static_cast<TaskState>(7));
+  RTT::internal::PortDataAccess::publish(invalid_port, static_cast<TaskState>(7));
   BOOST_CHECK(codec->portValue(&invalid_port, &invalid_encoded) ==
               RTT::opcua::PortValueStatus::error);
 }
@@ -379,9 +380,13 @@ BOOST_AUTO_TEST_CASE(output_port_value_distinguishes_unwritten_from_current) {
   BOOST_CHECK(codec->portValue(&port, &encoded) ==
               RTT::opcua::PortValueStatus::waiting_for_initial_data);
 
-  BOOST_TEST(port.write(42) == RTT::NotConnected);
+  BOOST_TEST(RTT::internal::PortDataAccess::publish(port, 42) == RTT::NotConnected);
   std::int32_t sample = 0;
-  BOOST_REQUIRE(port.getLastWrittenValue(sample));
+  BOOST_REQUIRE(port.snapshot(sample));
+  port.data() = 99;
+  std::int32_t committed = 0;
+  BOOST_REQUIRE(port.snapshot(committed));
+  BOOST_TEST(committed == 42);
   BOOST_TEST(sample == 42);
   BOOST_CHECK(codec->portValue(&port, &encoded) ==
               RTT::opcua::PortValueStatus::value);
@@ -474,7 +479,7 @@ BOOST_AUTO_TEST_CASE(rt_string_protocol_round_trips_all_surfaces) {
   BOOST_TEST(std::string(read_only->get().c_str()) == "written");
 
   RTT::OutputPort<RTT::rt_string> port("text");
-  port.write(RTT::rt_string("port"));
+  RTT::internal::PortDataAccess::publish(port, RTT::rt_string("port"));
   ::opcua::Variant port_value;
   BOOST_CHECK(codec->portValue(&port, &port_value) ==
               RTT::opcua::PortValueStatus::value);
@@ -557,7 +562,7 @@ BOOST_AUTO_TEST_CASE(conn_policy_protocol_round_trips_every_public_field) {
   checkConnPolicy(read_only->get(), expected);
 
   RTT::OutputPort<RTT::ConnPolicy> port("policy");
-  port.write(expected);
+  RTT::internal::PortDataAccess::publish(port, expected);
   ::opcua::Variant port_value;
   BOOST_CHECK(codec->portValue(&port, &port_value) ==
               RTT::opcua::PortValueStatus::value);

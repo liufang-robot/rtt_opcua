@@ -1484,7 +1484,7 @@ void appendPortBundle(
   if (input != nullptr) {
     insertNode(snapshot.nodes,
                inputPortValueSpec(port_path, *input, state, type_registry));
-  } else if (output->keepsLastWrittenValue()) {
+  } else {
     insertNode(snapshot.nodes,
                outputPortValueSpec(port_path, *output, state, type_registry));
   }
