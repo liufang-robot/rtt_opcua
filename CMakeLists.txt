@@ -81,6 +81,10 @@ target_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_link_libraries(rtt-transport-opcua orocos-rtt-opcua)
+# The public API uses ordinary C++ declarations. Export it in standalone MSVC
+# builds as well as in distribution builds that already enable this globally.
+set_target_properties(orocos-rtt-opcua rtt-transport-opcua PROPERTIES
+  WINDOWS_EXPORT_ALL_SYMBOLS ON)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(rtt-transport-opcua PRIVATE -Wall -Wextra -Wpedantic)
   if(RTT_OPCUA_WARNINGS_AS_ERRORS)
