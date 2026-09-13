@@ -16,6 +16,7 @@
 #include <exception>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -51,6 +52,9 @@ bool fail(std::string *error, std::string message) {
 }
 
 ConnPolicyWire toWire(const RTT::ConnPolicy &policy) {
+  if (!policy.validType()) {
+    throw std::invalid_argument("unsupported data-port connection type");
+  }
   return ConnPolicyWire{
       static_cast<std::int32_t>(policy.type),
       static_cast<std::int32_t>(policy.size),
@@ -69,6 +73,9 @@ ConnPolicyWire toWire(const RTT::ConnPolicy &policy) {
 RTT::ConnPolicy fromWire(const ConnPolicyWire &wire) {
   RTT::ConnPolicy policy;
   policy.type = wire.type;
+  if (!policy.validType()) {
+    throw std::invalid_argument("unsupported data-port connection type");
+  }
   policy.size = wire.size;
   policy.lock_policy = wire.lock_policy;
   policy.init = wire.init;
@@ -280,7 +287,7 @@ public:
       return PortValueStatus::error;
     }
     RTT::ConnPolicy sample;
-    if (!typed->getLastWrittenValue(sample)) {
+    if (!typed->snapshot(sample)) {
       return PortValueStatus::waiting_for_initial_data;
     }
     try {

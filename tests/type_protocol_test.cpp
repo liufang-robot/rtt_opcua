@@ -1,3 +1,4 @@
+#include <rtt/internal/PortDataAccess.hpp>
 #define BOOST_TEST_MODULE rtt_opcua_type_protocol
 #include <boost/test/included/unit_test.hpp>
 
@@ -22,6 +23,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -120,7 +122,7 @@ void exerciseArrayCodec(std::string_view type_name,
              boost::test_tools::per_element());
 
   RTT::OutputPort<std::vector<T>> port("values");
-  port.write(initial);
+  RTT::internal::PortDataAccess::publish(port, initial);
   ::opcua::Variant port_value;
   BOOST_CHECK(codec->portValue(&port, &port_value) ==
               RTT::opcua::PortValueStatus::value);
@@ -308,7 +310,7 @@ BOOST_AUTO_TEST_CASE(task_state_protocol_is_a_strict_bounded_int32_scalar) {
     BOOST_TEST(static_cast<std::int32_t>(typed->get()) == code);
 
     RTT::OutputPort<TaskState> port("state");
-    port.write(state);
+    RTT::internal::PortDataAccess::publish(port, state);
     ::opcua::Variant port_value;
     BOOST_CHECK(codec->portValue(&port, &port_value) ==
                 RTT::opcua::PortValueStatus::value);
@@ -364,7 +366,7 @@ BOOST_AUTO_TEST_CASE(task_state_protocol_is_a_strict_bounded_int32_scalar) {
   }
 
   RTT::OutputPort<TaskState> invalid_port("invalid-state");
-  invalid_port.write(static_cast<TaskState>(7));
+  RTT::internal::PortDataAccess::publish(invalid_port, static_cast<TaskState>(7));
   BOOST_CHECK(codec->portValue(&invalid_port, &invalid_encoded) ==
               RTT::opcua::PortValueStatus::error);
 }
@@ -379,9 +381,13 @@ BOOST_AUTO_TEST_CASE(output_port_value_distinguishes_unwritten_from_current) {
   BOOST_CHECK(codec->portValue(&port, &encoded) ==
               RTT::opcua::PortValueStatus::waiting_for_initial_data);
 
-  BOOST_TEST(port.write(42) == RTT::NotConnected);
+  BOOST_TEST(RTT::internal::PortDataAccess::publish(port, 42) == RTT::NotConnected);
   std::int32_t sample = 0;
-  BOOST_REQUIRE(port.getLastWrittenValue(sample));
+  BOOST_REQUIRE(port.snapshot(sample));
+  port.data() = 99;
+  std::int32_t committed = 0;
+  BOOST_REQUIRE(port.snapshot(committed));
+  BOOST_TEST(committed == 42);
   BOOST_TEST(sample == 42);
   BOOST_CHECK(codec->portValue(&port, &encoded) ==
               RTT::opcua::PortValueStatus::value);
@@ -474,7 +480,7 @@ BOOST_AUTO_TEST_CASE(rt_string_protocol_round_trips_all_surfaces) {
   BOOST_TEST(std::string(read_only->get().c_str()) == "written");
 
   RTT::OutputPort<RTT::rt_string> port("text");
-  port.write(RTT::rt_string("port"));
+  RTT::internal::PortDataAccess::publish(port, RTT::rt_string("port"));
   ::opcua::Variant port_value;
   BOOST_CHECK(codec->portValue(&port, &port_value) ==
               RTT::opcua::PortValueStatus::value);
@@ -484,7 +490,7 @@ BOOST_AUTO_TEST_CASE(rt_string_protocol_round_trips_all_surfaces) {
 
 BOOST_AUTO_TEST_CASE(conn_policy_protocol_round_trips_every_public_field) {
   RTT::ConnPolicy expected;
-  expected.type = RTT::ConnPolicy::BUFFER;
+  expected.type = RTT::ConnPolicy::DATA;
   expected.size = 17;
   expected.lock_policy = RTT::ConnPolicy::LOCKED;
   expected.init = true;
@@ -557,12 +563,69 @@ BOOST_AUTO_TEST_CASE(conn_policy_protocol_round_trips_every_public_field) {
   checkConnPolicy(read_only->get(), expected);
 
   RTT::OutputPort<RTT::ConnPolicy> port("policy");
-  port.write(expected);
+  RTT::internal::PortDataAccess::publish(port, expected);
   ::opcua::Variant port_value;
   BOOST_CHECK(codec->portValue(&port, &port_value) ==
               RTT::opcua::PortValueStatus::value);
   BOOST_REQUIRE(codec->assignVariant(port_value, source));
   checkConnPolicy(source->get(), expected);
+}
+
+BOOST_AUTO_TEST_CASE(conn_policy_protocol_rejects_removed_modes_without_replacing_valid_values) {
+  const auto registry = makeRegistry();
+  const auto *codec = registry->codecForTypeName("ConnPolicy");
+  BOOST_REQUIRE(codec);
+  RTT::ConnPolicy initial = RTT::ConnPolicy::data();
+  initial.size = 17; // Transport queue capacity remains independent of port delivery.
+  auto source = RTT::internal::ValueDataSource<RTT::ConnPolicy>::shared_ptr(
+      new RTT::internal::ValueDataSource<RTT::ConnPolicy>(initial));
+  ::opcua::Variant valid;
+  BOOST_REQUIRE(codec->toVariant(source, &valid));
+  ::opcua::Variant remote = valid;
+  auto proxy = boost::dynamic_pointer_cast<
+      RTT::internal::AssignableDataSource<RTT::ConnPolicy>>(
+      codec->makeProxyDataSource(
+          [&remote](::opcua::Variant *value) { *value = remote; return true; },
+          [&remote](const ::opcua::Variant &value) { remote = value; return true; }));
+  BOOST_REQUIRE(proxy);
+  BOOST_REQUIRE(proxy->evaluate());
+
+  for (std::int32_t kind : {1, 2, 42}) {
+    BOOST_TEST_CONTEXT("unsupported connection type " << kind) {
+      RTT::ConnPolicy invalid = initial;
+      invalid.type = kind;
+      auto invalidSource = RTT::internal::ValueDataSource<RTT::ConnPolicy>::shared_ptr(
+          new RTT::internal::ValueDataSource<RTT::ConnPolicy>(invalid));
+      ::opcua::Variant encoded;
+      BOOST_CHECK(!codec->toVariant(invalidSource, &encoded));
+
+      proxy->set(invalid);
+      BOOST_REQUIRE(codec->assignVariant(remote, source));
+      checkConnPolicy(source->get(), initial);
+
+      RTT::OutputPort<RTT::ConnPolicy> port("invalid_policy");
+      RTT::internal::PortDataAccess::publish(port, invalid);
+      BOOST_CHECK(codec->portValue(&port, &encoded) == RTT::opcua::PortValueStatus::error);
+
+      // A remote client may send the removed numeric kinds without our encoder.
+      // The first ConnPolicy wire field is Int32 type.
+      ::opcua::Variant invalidWire = valid;
+      std::memcpy(invalidWire.data(), &kind, sizeof(kind));
+      BOOST_CHECK(!codec->assignVariant(invalidWire, source));
+      checkConnPolicy(source->get(), initial);
+      BOOST_CHECK(!codec->makeDataSource(invalidWire));
+      remote = invalidWire;
+      BOOST_CHECK(!proxy->evaluate());
+      checkConnPolicy(proxy->value(), initial);
+      remote = valid;
+    }
+  }
+
+  initial.type = RTT::ConnPolicy::UNBUFFERED;
+  source->set(initial);
+  BOOST_REQUIRE(codec->toVariant(source, &valid));
+  BOOST_REQUIRE(codec->assignVariant(valid, source));
+  checkConnPolicy(source->get(), initial);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

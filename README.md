@@ -4,13 +4,26 @@
 the supported interface of an RTT `TaskContext` and can construct a remote RTT
 proxy from that model. The implementation uses open62541 through open62541pp.
 
+The ConnPolicy codec accepts DATA and the output-stream-only UNBUFFERED kind.
+Removed FIFO/circular-buffer kinds and unknown numeric kinds are rejected on
+encoding and decoding. Rejected incoming policies leave the last decoded proxy
+value intact; requests are never silently converted to latest-value delivery. The `size`
+field remains available for transport capacity, independently of data-port mode.
+
+Network input samples are staged in transport-owned channels and acquired at the
+component's next cyclic input boundary. Output values observe committed snapshots;
+editing an output working image does not publish it. Component scripting services
+expose input `status` and output `snapshot`, without consuming `read` or publishing
+`write` operations. Remote mirror ports are advanced by the transport pump and
+preserve pending samples across backpressure and reconnects.
+
 The package is generic transport infrastructure. The OPC UA deployment
 component, `deployer-opcua-<target>`, and `ctaskbrowser-opcua-<target>` are
 provided by OCL.
 
 ## Current Scope
 
-- C++20
+- C++20 and RTT 3.0 or newer
 - open62541pp 0.21.2 or newer within the 0.21 API series
 - server binding restricted to `127.0.0.1`, `::1`, or the explicit IPv4
   wildcard `0.0.0.0`

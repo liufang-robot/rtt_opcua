@@ -10,7 +10,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(OROCOS-RTT REQUIRED)
+find_package(OROCOS-RTT 3.0 REQUIRED)
 find_package(open62541 CONFIG REQUIRED)
 find_package(open62541pp 0.21.2 CONFIG REQUIRED)
 
@@ -81,6 +81,10 @@ target_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_link_libraries(rtt-transport-opcua orocos-rtt-opcua)
+# The public API uses ordinary C++ declarations. Export it in standalone MSVC
+# builds as well as in distribution builds that already enable this globally.
+set_target_properties(orocos-rtt-opcua rtt-transport-opcua PROPERTIES
+  WINDOWS_EXPORT_ALL_SYMBOLS ON)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(rtt-transport-opcua PRIVATE -Wall -Wextra -Wpedantic)
   if(RTT_OPCUA_WARNINGS_AS_ERRORS)

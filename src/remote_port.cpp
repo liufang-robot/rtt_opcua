@@ -1,4 +1,5 @@
 #include "remote_port.hpp"
+#include <rtt/internal/PortDataAccess.hpp>
 
 #include <rtt/base/InputPortInterface.hpp>
 #include <rtt/base/OutputPortInterface.hpp>
@@ -155,7 +156,10 @@ void RemotePortAdapter::pumpInput() {
       return;
     }
     RTT::base::DataSourceBase::shared_ptr value = type_info_->buildValue();
-    if (!value || input->read(value, false) != RTT::NewData) {
+    // This mirror has no component updateHook; the transport pump owns its
+    // channel acquisition and retains failed requests in pending_input_source_.
+    if (!value || RTT::internal::PortDataAccess::receive(*input, value, false) !=
+                      RTT::NewData) {
       return;
     }
     pending_input_source_ = std::move(value);
@@ -187,7 +191,8 @@ void RemotePortAdapter::pumpOutput() {
   }
 
   if (pending_output_) {
-    const RTT::WriteStatus status = output->write(pending_output_);
+    const RTT::WriteStatus status =
+        RTT::internal::PortDataAccess::publish(*output, pending_output_);
     if (status != RTT::WriteSuccess) {
       setError("local mirror for remote output port '" + description_.name +
                "' returned " +
@@ -214,7 +219,8 @@ void RemotePortAdapter::pumpOutput() {
              description_.name + "'");
     return;
   }
-  const RTT::WriteStatus write_status = output->write(pending_output_);
+  const RTT::WriteStatus write_status =
+      RTT::internal::PortDataAccess::publish(*output, pending_output_);
   if (write_status != RTT::WriteSuccess) {
     setError(
         "local mirror for remote output port '" + description_.name +
