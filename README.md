@@ -10,12 +10,30 @@ encoding and decoding. Rejected incoming policies leave the last decoded proxy
 value intact; requests are never silently converted to latest-value delivery. The `size`
 field remains available for transport capacity, independently of data-port mode.
 
-Network input samples are staged in transport-owned channels and acquired at the
-component's next cyclic input boundary. Output values observe committed snapshots;
-editing an output working image does not publish it. Component scripting services
-expose input `status` and output `snapshot`, without consuming `read` or publishing
-`write` operations. Remote mirror ports are advanced by the transport pump and
-preserve pending samples across backpressure and reconnects.
+Publishing a component only observes its ports and creates no RTT connections.
+Input values show configured defaults and then the last component-acquired image;
+output values show the last committed publication. Output reads wait for the
+first commit. There are no generated RTT port services or snapshot operations.
+
+External writes require explicit stopped configuration after publication:
+
+```cpp
+model.enableInputWrite(component, "command", &error);       // whole input
+model.enableInputWrite(component, "motion.target.x", &error); // selected member
+```
+
+A whole source makes `ports/command/value` writable. A selected source creates
+`ports/target/members/x` below its service; nested selectors and fixed indices
+use one percent-escaped member segment. Writes supply the exact selected type,
+stage a sample, and become visible to reads only after component acquisition.
+Overlapping local/network writers are rejected; outputs remain read-only.
+`disableInputWrite(component, endpoint, &error)` releases the source while stopped
+and keeps any selected Variable as read-only observation. NumericRange access is
+not supported; use typed selected Variables.
+
+Remote mirrors preserve channel transfers and pending samples across reconnects.
+Their passive observation reads the remote value independently of local channel
+connections, so TaskBrowser can inspect `component.output.y` directly.
 
 The package is generic transport infrastructure. The OPC UA deployment
 component, `deployer-opcua-<target>`, and `ctaskbrowser-opcua-<target>` are

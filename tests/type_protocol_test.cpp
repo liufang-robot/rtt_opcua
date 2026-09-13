@@ -1,4 +1,7 @@
 #include <rtt/internal/PortDataAccess.hpp>
+#include <rtt/PortEndpoint.hpp>
+#include <rtt/InputPort.hpp>
+#include <rtt/TaskContext.hpp>
 #define BOOST_TEST_MODULE rtt_opcua_type_protocol
 #include <boost/test/included/unit_test.hpp>
 
@@ -369,6 +372,37 @@ BOOST_AUTO_TEST_CASE(task_state_protocol_is_a_strict_bounded_int32_scalar) {
   RTT::internal::PortDataAccess::publish(invalid_port, static_cast<TaskState>(7));
   BOOST_CHECK(codec->portValue(&invalid_port, &invalid_encoded) ==
               RTT::opcua::PortValueStatus::error);
+}
+
+BOOST_AUTO_TEST_CASE(input_observation_codec_tracks_acquisition_instead_of_staging) {
+  const auto registry = makeRegistry();
+  const auto *codec = registry->codecForTypeName("Int32");
+  BOOST_REQUIRE(codec);
+  RTT::TaskContext owner("input-codec");
+  RTT::InputPort<std::int32_t> port("value");
+  owner.addPort(port);
+  std::string error;
+  auto observation = RTT::PortObservation::create({&port, ""}, &error);
+  BOOST_REQUIRE_MESSAGE(observation, error);
+  BOOST_TEST(observation->available());
+  BOOST_TEST(!observation->dataSource()->isAssignable());
+  ::opcua::Variant encoded;
+  BOOST_REQUIRE(codec->toVariant(observation->snapshot(), &encoded));
+  BOOST_TEST(encoded.to<std::int32_t>() == 0);
+  auto source = RTT::PortInputSource::create({&port, ""}, &error);
+  BOOST_REQUIRE_MESSAGE(source, error);
+  RTT::base::DataSourceBase::shared_ptr sample =
+      new RTT::internal::ValueDataSource<std::int32_t>(47);
+  BOOST_REQUIRE_MESSAGE(source->stage(sample, &error), error);
+  BOOST_REQUIRE(codec->toVariant(observation->snapshot(), &encoded));
+  BOOST_TEST(encoded.to<std::int32_t>() == 0);
+  BOOST_TEST(RTT::internal::PortDataAccess::refresh(port) == RTT::NewData);
+  BOOST_REQUIRE(codec->toVariant(observation->snapshot(), &encoded));
+  BOOST_TEST(encoded.to<std::int32_t>() == 47);
+  BOOST_TEST(port.status() == RTT::NewData);
+  BOOST_REQUIRE_MESSAGE(source->disconnect(&error), error);
+  BOOST_REQUIRE(codec->toVariant(observation->snapshot(), &encoded));
+  BOOST_TEST(encoded.to<std::int32_t>() == 47);
 }
 
 BOOST_AUTO_TEST_CASE(output_port_value_distinguishes_unwritten_from_current) {

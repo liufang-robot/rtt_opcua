@@ -1,4 +1,6 @@
 #include <rtt/internal/PortDataAccess.hpp>
+#include <rtt/internal/CyclicDataFlow.hpp>
+#include "custom_datatype_test_support.hpp"
 #define BOOST_TEST_MODULE rtt_opcua_object_model
 #include <boost/test/included/unit_test.hpp>
 
@@ -23,6 +25,7 @@
 #include <rtt/base/PortInterface.hpp>
 #include <rtt/internal/GlobalEngine.hpp>
 #include <rtt/internal/SharedConnection.hpp>
+#include <rtt/extras/SlaveActivity.hpp>
 #include <rtt/typekit/RealTimeTypekit.hpp>
 #include <rtt/types/TemplateTypeInfo.hpp>
 #include <rtt/types/Types.hpp>
@@ -236,6 +239,8 @@ struct CanonicalTypesFixture {
       RTT::types::RealTimeTypekitPlugin().loadTypes();
     }
     BOOST_REQUIRE(RTT::opcua::registerCanonicalTypeProtocols());
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(RTT::opcua::test::registerFixtureType(&error), error);
   }
 };
 
@@ -696,9 +701,31 @@ class ThrowingInputPort final : public RTT::InputPort<std::int32_t> {
 public:
   using RTT::InputPort<std::int32_t>::InputPort;
 
-  RTT::base::PortInterface *antiClone() const override {
-    throw std::runtime_error("intentional antiClone failure");
+  RTT::base::DataSourceBase *getDataSource() override {
+    throw std::runtime_error("intentional observation failure");
   }
+};
+
+class ThrowingReleaseOutput final : public RTT::OutputPort<std::int32_t> {
+public:
+  explicit ThrowingReleaseOutput(bool &fail) : fail_(fail) {}
+  void disconnect() override {
+    if (fail_) throw std::runtime_error("intentional source release failure");
+    RTT::OutputPort<std::int32_t>::disconnect();
+  }
+private:
+  bool &fail_;
+};
+
+class ThrowingReleaseInput final : public RTT::InputPort<std::int32_t> {
+public:
+  explicit ThrowingReleaseInput(bool &fail)
+      : RTT::InputPort<std::int32_t>("input"), fail_(fail) {}
+  RTT::base::PortInterface *antiClone() const override {
+    return new ThrowingReleaseOutput(fail_);
+  }
+private:
+  bool &fail_;
 };
 
 class CallbackFailureComponent final : public RTT::TaskContext {
@@ -722,7 +749,7 @@ public:
         candidate_parent_(std::move(candidate_parent)),
         foreign_id_(std::move(foreign_id)) {}
 
-  RTT::base::PortInterface *antiClone() const override {
+  RTT::base::DataSourceBase *getDataSource() override {
     std::string error;
     bool linked = false;
     const bool invoked = server_.invoke(
@@ -737,7 +764,7 @@ public:
       throw std::runtime_error("failed to add reentrant foreign reference: " +
                                error);
     }
-    throw std::runtime_error("intentional reentrant antiClone failure");
+    throw std::runtime_error("intentional reentrant observation failure");
   }
 
 private:
@@ -773,7 +800,7 @@ public:
       : RTT::InputPort<std::int32_t>("ReentrantInspectionInput"),
         server_(server), properties_id_(std::move(properties_id)) {}
 
-  RTT::base::PortInterface *antiClone() const override {
+  RTT::base::DataSourceBase *getDataSource() override {
     std::string error;
     bool removed = false;
     const bool invoked = server_.invoke(
@@ -975,6 +1002,163 @@ BOOST_FIXTURE_TEST_CASE(publish_component_omits_empty_root_categories,
   server.stop();
 }
 
+BOOST_FIXTURE_TEST_CASE(port_publication_is_passive_over_existing_connections,
+                        CanonicalTypesFixture) {
+  RTT::TaskContext component("passive");
+  component.setActivity(new RTT::extras::SlaveActivity(0.01));
+  RTT::InputPort<double> input("input");
+  RTT::OutputPort<double> output("output"), local_source("local_source");
+  component.ports()->addPort(input);
+  component.ports()->addPort(output);
+  BOOST_REQUIRE(local_source.createConnection(input));
+  BOOST_REQUIRE(!output.connected());
+  BOOST_REQUIRE(component.configure());
+  BOOST_REQUIRE(component.start());
+
+  RTT::opcua::ServerOptions options;
+  options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(component, &error), error);
+  BOOST_TEST(input.connected());
+  BOOST_TEST(local_source.connected());
+  BOOST_TEST(!output.connected());
+  BOOST_TEST(component.isRunning());
+  BOOST_TEST(!model.enableInputWrite(component, "input", &error));
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto input_id = modelNodeId(*server.namespaceIndex(),
+      {"components", "passive", "ports", "input", "value"});
+  const auto initial = ::opcua::services::readValue(client, input_id);
+  BOOST_REQUIRE(initial);
+  BOOST_TEST(initial->to<double>() == 0.0);
+  BOOST_TEST(::opcua::services::writeValue(client, input_id,
+      ::opcua::Variant(3.0)) == UA_STATUSCODE_BADNOTWRITABLE);
+  BOOST_REQUIRE(component.stop());
+}
+
+BOOST_FIXTURE_TEST_CASE(explicit_input_regions_stage_for_the_next_acquisition,
+                        CanonicalTypesFixture) {
+  using RTT::opcua::test::FixtureValue;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(RTT::opcua::test::registerFixtureType(&error), error);
+  RTT::TaskContext component("regions");
+  auto io = RTT::Service::Create("io", &component);
+  component.provides()->addService(io);
+  RTT::InputPort<FixtureValue> input("input");
+  RTT::OutputPort<FixtureValue> output("output");
+  RTT::OutputPort<double> local_source("local_source");
+  io->addPort(input);
+  io->addPort(output);
+  BOOST_REQUIRE(RTT::connectMembers(local_source, "", input, "scale"));
+  RTT::opcua::ServerOptions options;
+  options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(options);
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  RTT::opcua::ObjectModel model(server);
+  BOOST_TEST(!model.enableInputWrite(component, "io.input.count", &error));
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(component, &error), error);
+  BOOST_TEST(!model.enableInputWrite(component, "io.output.count", &error));
+  BOOST_TEST(!model.enableInputWrite(component, "io.input", &error));
+  BOOST_TEST(!model.enableInputWrite(component, "io.input.scale", &error));
+  BOOST_TEST(!model.enableInputWrite(component, "io.input.missing", &error));
+  const auto collision_id = modelNodeId(*server.namespaceIndex(),
+      {"components", "regions", "services", "io", "ports", "input", "members", "count"});
+  bool collision_created = false;
+  BOOST_REQUIRE_MESSAGE(server.invoke([&](::opcua::Server &native) {
+    ::opcua::VariableAttributes attributes;
+    attributes.setDataType(::opcua::DataTypeId::Int32);
+    attributes.setValue(::opcua::Variant(std::int32_t{99}));
+    attributes.setAccessLevel(::opcua::AccessLevel::CurrentRead);
+    collision_created = static_cast<bool>(::opcua::services::addVariable(
+        native, ::opcua::ObjectId::ObjectsFolder, collision_id,
+        "foreign-member", attributes,
+        ::opcua::VariableTypeId::BaseDataVariableType,
+        ::opcua::ReferenceTypeId::HasComponent));
+  }, std::chrono::seconds(5), &error), error);
+  BOOST_REQUIRE(collision_created);
+  BOOST_TEST(!model.enableInputWrite(component, "io.input.count", &error));
+  BOOST_TEST(input.getSourceConnections().size() == 1U);
+  BOOST_TEST(local_source.connected());
+  bool collision_preserved = false;
+  BOOST_REQUIRE_MESSAGE(server.invoke([&](::opcua::Server &native) {
+    const auto value = ::opcua::services::readValue(native, collision_id);
+    collision_preserved = value && value->to<std::int32_t>() == 99 &&
+        ::opcua::services::deleteNode(native, collision_id, true).isGood();
+  }, std::chrono::seconds(5), &error), error);
+  BOOST_REQUIRE(collision_preserved);
+  BOOST_REQUIRE_MESSAGE(model.enableInputWrite(component, "io.input.count", &error), error);
+  input.disconnect();
+  BOOST_TEST(!input.connected());
+  BOOST_REQUIRE(RTT::connectMembers(local_source, "", input, "scale"));
+  BOOST_REQUIRE_MESSAGE(model.enableInputWrite(component, "io.input.count", &error), error);
+  BOOST_TEST(input.getSourceConnections().size() == 2U);
+  BOOST_REQUIRE_MESSAGE(model.enableInputWrite(component, "io.input.count", &error), error);
+  BOOST_REQUIRE(component.finalizeConnections());
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto count_id = modelNodeId(*server.namespaceIndex(),
+      {"components", "regions", "services", "io", "ports", "input", "members", "count"});
+  const auto whole_id = modelNodeId(*server.namespaceIndex(),
+      {"components", "regions", "services", "io", "ports", "input", "value"});
+  requirePortValueSchema(client, count_id, ::opcua::DataTypeId::Int32,
+                        ::opcua::ValueRank::Scalar, true, true);
+  BOOST_TEST(::opcua::services::readValue(client, count_id)->to<std::int32_t>() == 0);
+  BOOST_TEST(::opcua::services::writeValue(client, count_id, ::opcua::Variant(8.0)) ==
+             UA_STATUSCODE_BADTYPEMISMATCH);
+  BOOST_REQUIRE(::opcua::services::writeValue(client, count_id,
+                  ::opcua::Variant(std::int32_t{8})).isGood());
+  BOOST_TEST(::opcua::services::readValue(client, count_id)->to<std::int32_t>() == 0);
+  BOOST_REQUIRE(RTT::internal::PortDataAccess::publish(local_source, 2.5) == RTT::WriteSuccess);
+  BOOST_REQUIRE(component.cyclicDataFlow().refresh());
+  BOOST_TEST(input.data().count == 8);
+  BOOST_TEST(input.data().scale == 2.5);
+  BOOST_TEST(::opcua::services::readValue(client, count_id)->to<std::int32_t>() == 8);
+  BOOST_TEST(::opcua::services::writeValue(client, whole_id,
+      ::opcua::Variant(std::int32_t{9})) == UA_STATUSCODE_BADNOTWRITABLE);
+  BOOST_REQUIRE_MESSAGE(model.disableInputWrite(component, "io.input.count", &error), error);
+  BOOST_TEST(local_source.connected());
+  requirePortValueSchema(client, count_id, ::opcua::DataTypeId::Int32,
+                        ::opcua::ValueRank::Scalar, true, false);
+  BOOST_TEST(::opcua::services::readValue(client, count_id)->to<std::int32_t>() == 8);
+  BOOST_TEST(::opcua::services::writeValue(client, count_id,
+      ::opcua::Variant(std::int32_t{9})) == UA_STATUSCODE_BADNOTWRITABLE);
+}
+
+BOOST_FIXTURE_TEST_CASE(failed_source_release_preserves_writable_endpoint,
+                        CanonicalTypesFixture) {
+  RTT::TaskContext component("release_failure");
+  bool fail_release = false;
+  ThrowingReleaseInput input(fail_release);
+  component.addPort(input);
+  RTT::opcua::ServerOptions options;
+  options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(component, &error), error);
+  BOOST_REQUIRE_MESSAGE(model.enableInputWrite(component, "input", &error), error);
+  fail_release = true;
+  BOOST_TEST(!model.disableInputWrite(component, "input", &error));
+  fail_release = false;
+  BOOST_TEST(input.connected());
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto id = modelNodeId(*server.namespaceIndex(),
+      {"components", "release_failure", "ports", "input", "value"});
+  requirePortValueSchema(client, id, ::opcua::DataTypeId::Int32,
+                        ::opcua::ValueRank::Scalar, true, true);
+  BOOST_REQUIRE(::opcua::services::writeValue(client, id,
+                  ::opcua::Variant(std::int32_t{17})).isGood());
+  BOOST_REQUIRE(RTT::internal::PortDataAccess::refresh(input) == RTT::NewData);
+  BOOST_TEST(input.data() == 17);
+  BOOST_REQUIRE_MESSAGE(model.disableInputWrite(component, "input", &error), error);
+}
+
 BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
                         CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;
@@ -1059,18 +1243,12 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
   const auto trigger_write_id = modelNodeId(
       namespace_index,
       {"components", "arm/left", "ports", "Trigger", "write"});
-  const auto command_service_operations_id = modelNodeId(
-      namespace_index,
-      {"components", "arm/left", "services", "Command", "operations"});
   const auto command_service_status_id = modelNodeId(
       namespace_index, {"components", "arm/left", "services", "Command",
                         "operations", "status"});
   const auto command_service_clear_id = modelNodeId(
       namespace_index, {"components", "arm/left", "services", "Command",
                         "operations", "clear"});
-  const auto feedback_service_operations_id = modelNodeId(
-      namespace_index,
-      {"components", "arm/left", "services", "Feedback", "operations"});
   const auto feedback_service_write_id = modelNodeId(
       namespace_index, {"components", "arm/left", "services", "Feedback",
                         "operations", "write"});
@@ -1203,28 +1381,24 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
   requirePortDirection(client, nested_input_id, motion_command_direction_id,
                        RTT::opcua::PortDirection::input);
   requirePortValueSchema(client, command_value_id, ::opcua::DataTypeId::UInt16,
-                         ::opcua::ValueRank::Scalar, true, true);
+                         ::opcua::ValueRank::Scalar, true, false);
   requirePortValueSchema(client, trigger_value_id, ::opcua::DataTypeId::Int32,
-                         ::opcua::ValueRank::Scalar, true, true);
+                         ::opcua::ValueRank::Scalar, true, false);
   requirePortValueSchema(client, feedback_value_id, ::opcua::DataTypeId::Double,
                          ::opcua::ValueRank::Scalar, true, false);
   requireMissingNode(client, feedback_read_id);
   requireMissingNode(client, command_write_id);
   requireMissingNode(client, trigger_write_id);
-  BOOST_TEST(static_cast<bool>(
-      ::opcua::services::readNodeClass(client, command_service_status_id)));
+  requireMissingNode(client, command_service_status_id);
   requireMissingNode(client, command_service_clear_id);
   requireMissingNode(client, feedback_service_write_id);
-  BOOST_TEST(static_cast<bool>(
-      ::opcua::services::readNodeClass(client, feedback_service_snapshot_id)));
-  BOOST_TEST(static_cast<bool>(
-      ::opcua::services::readNodeClass(client, trigger_service_status_id)));
+  requireMissingNode(client, feedback_service_snapshot_id);
+  requireMissingNode(client, trigger_service_status_id);
   BOOST_TEST(static_cast<bool>(
       ::opcua::services::readNodeClass(client, nested_output_id)));
   BOOST_TEST(static_cast<bool>(
       ::opcua::services::readNodeClass(client, nested_input_id)));
-  BOOST_TEST(static_cast<bool>(
-      ::opcua::services::readNodeClass(client, nested_port_service_id)));
+  requireMissingNode(client, nested_port_service_id);
   BOOST_TEST(::opcua::services::readValue(client, service_property_id)
                  .value()
                  .to<std::uint16_t>() == 2U);
@@ -1352,7 +1526,8 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
       client, command_value_id, ::opcua::AttributeId::Value,
       ::opcua::TimestampsToReturn::Neither);
   BOOST_REQUIRE(command_read);
-  BOOST_TEST(command_read->status() == UA_STATUSCODE_BADWAITINGFORINITIALDATA);
+  BOOST_TEST(command_read->status().isGood());
+  BOOST_TEST(command_read->value().to<std::uint16_t>() == 0U);
 
   ::opcua::SubscriptionParameters subscription_parameters;
   subscription_parameters.publishingInterval = 10.0;
@@ -1373,7 +1548,9 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
     client.runIterate(10U);
     return input_monitor_status.has_value();
   }));
-  BOOST_TEST(*input_monitor_status == UA_STATUSCODE_BADWAITINGFORINITIALDATA);
+  BOOST_TEST(input_monitor_status->isGood());
+  BOOST_REQUIRE(input_monitor_value);
+  BOOST_TEST(*input_monitor_value == 0U);
 
   std::mutex notification_mutex;
   std::vector<double> notifications;
@@ -1393,9 +1570,9 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
         notifications.push_back(data.value().to<double>());
       });
 
-  BOOST_TEST(RTT::internal::PortDataAccess::publish(component.feedback, 4.25) == RTT::WriteSuccess);
-  BOOST_TEST(RTT::internal::PortDataAccess::publish(component.feedback, 5.25) == RTT::WriteSuccess);
-  BOOST_TEST(RTT::internal::PortDataAccess::publish(component.feedback, 6.25) == RTT::WriteSuccess);
+  BOOST_TEST(RTT::internal::PortDataAccess::publish(component.feedback, 4.25) == RTT::NotConnected);
+  BOOST_TEST(RTT::internal::PortDataAccess::publish(component.feedback, 5.25) == RTT::NotConnected);
+  BOOST_TEST(RTT::internal::PortDataAccess::publish(component.feedback, 6.25) == RTT::NotConnected);
   component.feedback.data() = 99.0; // An observer must not expose this working image.
   BOOST_TEST(::opcua::services::readValue(client, feedback_value_id)
                  .value()
@@ -1412,6 +1589,10 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
     return !notifications.empty() && notifications.back() == 6.25;
   }));
 
+  BOOST_REQUIRE_MESSAGE(model.enableInputWrite(component, "Command", &error), error);
+  requirePortValueSchema(client, command_value_id, ::opcua::DataTypeId::UInt16,
+                         ::opcua::ValueRank::Scalar, true, true);
+
   BOOST_TEST(::opcua::services::writeValue(
                  client, command_value_id,
                  ::opcua::Variant(std::string("not-an-integer"))) ==
@@ -1424,8 +1605,8 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
       client, command_value_id, ::opcua::AttributeId::Value,
       ::opcua::TimestampsToReturn::Neither);
   BOOST_REQUIRE(unwritten_command);
-  BOOST_TEST(unwritten_command->status() ==
-             UA_STATUSCODE_BADWAITINGFORINITIALDATA);
+  BOOST_TEST(unwritten_command->status().isGood());
+  BOOST_TEST(unwritten_command->value().to<std::uint16_t>() == 0U);
   std::uint16_t commanded_value = 0U;
   BOOST_TEST(RTT::internal::PortDataAccess::receive(component.command, commanded_value) == RTT::NoData);
 
@@ -1434,7 +1615,10 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
                                     ::opcua::Variant(std::uint16_t{73U}))
           .isGood());
   BOOST_TEST(component.command.data() == 0U);
-  BOOST_REQUIRE(RTT::internal::PortDataAccess::receive(component.command, commanded_value) == RTT::NewData);
+  BOOST_TEST(::opcua::services::readValue(client, command_value_id)
+                 .value().to<std::uint16_t>() == 0U);
+  BOOST_REQUIRE(RTT::internal::PortDataAccess::refresh(component.command) == RTT::NewData);
+  commanded_value = component.command.data();
   BOOST_TEST(commanded_value == 73U);
   BOOST_TEST(::opcua::services::readValue(client, command_value_id)
                  .value()
@@ -1447,7 +1631,8 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
       ::opcua::services::writeValue(client, command_value_id,
                                     ::opcua::Variant(std::uint16_t{73U}))
           .isGood());
-  BOOST_REQUIRE(RTT::internal::PortDataAccess::receive(component.command, commanded_value) == RTT::NewData);
+  BOOST_REQUIRE(RTT::internal::PortDataAccess::refresh(component.command) == RTT::NewData);
+  commanded_value = component.command.data();
   BOOST_TEST(commanded_value == 73U);
   BOOST_TEST(::opcua::services::readValue(client, command_value_id)
                  .value()
@@ -1456,48 +1641,27 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
       ::opcua::services::writeValue(client, command_value_id,
                                     ::opcua::Variant(std::uint16_t{74U}))
           .isGood());
-  BOOST_REQUIRE(RTT::internal::PortDataAccess::receive(component.command, commanded_value) == RTT::NewData);
+  BOOST_REQUIRE(RTT::internal::PortDataAccess::refresh(component.command) == RTT::NewData);
+  commanded_value = component.command.data();
   BOOST_TEST(commanded_value == 74U);
   BOOST_TEST(::opcua::services::readValue(client, command_value_id)
                  .value()
                  .to<std::uint16_t>() == 74U);
 
-  const auto adapter_status_result = ::opcua::services::call(
-      client, command_service_operations_id, command_service_status_id, {});
-  BOOST_REQUIRE(adapter_status_result.statusCode().isGood());
-  BOOST_REQUIRE_EQUAL(adapter_status_result.outputArguments().size(), 1U);
-  BOOST_TEST(adapter_status_result.outputArguments()[0].to<std::int32_t>() ==
-             static_cast<std::int32_t>(RTT::NoData));
-  // Transport channel reads above leave component image freshness untouched.
-  BOOST_TEST(component.command.data() == 0U);
-  component.command.clear();
-  BOOST_TEST(RTT::internal::PortDataAccess::receive(component.command, commanded_value) == RTT::NoData);
-
-  component.command.disconnect();
-  BOOST_TEST(
-      ::opcua::services::writeValue(client, command_value_id,
-                                    ::opcua::Variant(std::uint16_t{75U})) ==
-      UA_STATUSCODE_BADNOTCONNECTED);
+  // The observed input advances only when the component acquires the sample.
+  BOOST_TEST(component.command.data() == 74U);
+  BOOST_REQUIRE_MESSAGE(model.disableInputWrite(component, "Command", &error), error);
+  BOOST_TEST(!component.command.connected());
+  BOOST_TEST(::opcua::services::writeValue(client, command_value_id,
+      ::opcua::Variant(std::uint16_t{75U})) == UA_STATUSCODE_BADNOTWRITABLE);
   BOOST_TEST(::opcua::services::readValue(client, command_value_id)
-                 .value()
-                 .to<std::uint16_t>() == 74U);
-
-  // Publishing through a component's scripting service is unavailable.
-  const auto adapter_write_result = ::opcua::services::call(
-      client, feedback_service_operations_id, feedback_service_write_id,
-      {::opcua::Variant(8.25)});
-  BOOST_TEST(adapter_write_result.statusCode().isBad());
-  const auto adapter_snapshot_result = ::opcua::services::call(
-      client, feedback_service_operations_id, feedback_service_snapshot_id, {});
-  BOOST_REQUIRE(adapter_snapshot_result.statusCode().isGood());
-  BOOST_REQUIRE_EQUAL(adapter_snapshot_result.outputArguments().size(), 1U);
-  BOOST_TEST(adapter_snapshot_result.outputArguments()[0].to<double>() == 6.25);
+                 .value().to<std::uint16_t>() == 74U);
+  requireMissingNode(client, feedback_service_snapshot_id);
   BOOST_TEST(::opcua::services::readValue(client, feedback_value_id)
-                 .value()
-                 .to<double>() == 6.25);
+                 .value().to<double>() == 6.25);
   BOOST_TEST(::opcua::services::readValue(client, revision_id)
                  .value()
-                 .to<std::uint64_t>() == 1U);
+                 .to<std::uint64_t>() == 3U);
 
   input_monitor.deleteMonitoredItem();
   feedback_monitor.deleteMonitoredItem();
@@ -1519,6 +1683,7 @@ BOOST_FIXTURE_TEST_CASE(port_values_reject_closed_component_state,
   {
     RTT::opcua::ObjectModel model(server);
     BOOST_REQUIRE_MESSAGE(model.publishComponent(component, &error), error);
+    BOOST_REQUIRE_MESSAGE(model.enableInputWrite(component, "Command", &error), error);
   }
 
   ::opcua::Client client;
@@ -2141,8 +2306,8 @@ BOOST_FIXTURE_TEST_CASE(unsupported_resource_rejects_the_whole_component,
   BOOST_TEST(!model.publishComponent(component, &error, &diagnostics));
   BOOST_TEST(model.componentCount() == 0U);
   BOOST_TEST(model.revision() == 0U);
-  BOOST_TEST(diagnostics.size() == 7U);
-  BOOST_REQUIRE_EQUAL(diagnostics.size(), 7U);
+  BOOST_TEST(diagnostics.size() == 6U);
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 6U);
   BOOST_TEST(model.unsupportedResources(component.getName()) == diagnostics,
              boost::test_tools::per_element());
   BOOST_TEST(std::ranges::is_sorted(diagnostics));
@@ -2153,7 +2318,6 @@ BOOST_FIXTURE_TEST_CASE(unsupported_resource_rejects_the_whole_component,
       {"unsupported.UnsupportedAttribute", "attribute"},
       {"unsupported.UnsupportedInput", "input port"},
       {"unsupported.UnsupportedOutput", "output port"},
-      {"unsupported.UnsupportedOutput.snapshot", "operation"},
       {"unsupported.UnsupportedProperty", "property"},
       {"unsupported.consume", "operation"},
       {"unsupported.produce", "operation"},
@@ -2189,11 +2353,6 @@ BOOST_FIXTURE_TEST_CASE(unsupported_resource_rejects_the_whole_component,
            component.getName(), {},
            "services/unsupported/properties/UnsupportedProperty",
            "property uses RTT type '/test/UnsupportedValue' which has no "
-           "registered OPC UA protocol"},
-          {RTT::opcua::PublicationDiagnosticKind::unsupported_resource,
-           component.getName(), {},
-           "services/unsupported/services/UnsupportedOutput/operations/snapshot",
-           "operation uses RTT type '/test/UnsupportedValue' which has no "
            "registered OPC UA protocol"},
       };
   const auto publication_diagnostics =
@@ -2318,7 +2477,7 @@ BOOST_FIXTURE_TEST_CASE(
 }
 
 BOOST_FIXTURE_TEST_CASE(
-    recursive_unsupported_selection_reports_only_its_seven_resource_failures,
+    recursive_unsupported_selection_reports_only_its_six_resource_failures,
     CanonicalTypesFixture) {
   registerUnsupportedValueType();
   RTT::opcua::ServerOptions server_options;
@@ -2333,9 +2492,9 @@ BOOST_FIXTURE_TEST_CASE(
   BOOST_TEST(!model.publishComponentSelected(
       component, {"services/unsupported/**"}, &error, &diagnostics));
   BOOST_TEST(error == "selective OPC UA publication rejected component '" +
-                          component.getName() + "' with 7 diagnostic(s)");
-  BOOST_REQUIRE_EQUAL(diagnostics.size(), 7U);
-  BOOST_TEST(model.unsupportedResources(component.getName()).size() == 7U);
+                          component.getName() + "' with 6 diagnostic(s)");
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 6U);
+  BOOST_TEST(model.unsupportedResources(component.getName()).size() == 6U);
   BOOST_TEST(model.publicationDiagnostics(component.getName()) == diagnostics,
              boost::test_tools::per_element());
   BOOST_TEST(std::ranges::is_sorted(diagnostics));
@@ -2352,7 +2511,6 @@ BOOST_FIXTURE_TEST_CASE(
       "services/unsupported/ports/UnsupportedInput",
       "services/unsupported/ports/UnsupportedOutput",
       "services/unsupported/properties/UnsupportedProperty",
-      "services/unsupported/services/UnsupportedOutput/operations/snapshot",
   };
   BOOST_TEST(paths == expected_paths, boost::test_tools::per_element());
   BOOST_TEST(model.componentCount() == 0U);
@@ -2564,7 +2722,7 @@ BOOST_FIXTURE_TEST_CASE(
 }
 
 BOOST_FIXTURE_TEST_CASE(
-    port_and_same_named_adapter_service_are_selected_independently,
+    port_and_same_named_real_service_are_selected_independently,
     CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;
   server_options.port = unusedLoopbackPort();
@@ -2575,6 +2733,10 @@ BOOST_FIXTURE_TEST_CASE(
 
   SelectableResourceComponent port_component("selected-port");
   SelectableResourceComponent service_component("selected-port-service");
+  auto command_service = RTT::Service::Create("Command", &service_component);
+  command_service->addOperation("status", &RTT::TaskContext::getTaskState,
+                                &service_component, RTT::ClientThread);
+  service_component.provides()->addService(command_service);
   RTT::opcua::ObjectModel model(server);
   BOOST_REQUIRE_MESSAGE(
       model.publishComponentSelected(port_component, {"ports/Command"}, &error),
@@ -2609,7 +2771,7 @@ BOOST_FIXTURE_TEST_CASE(
       client,
       modelNodeId(namespace_index, {"components", port_component.getName(),
                                     "ports", "Command", "value"}),
-      ::opcua::DataTypeId::Int32, ::opcua::ValueRank::Scalar, true, true);
+      ::opcua::DataTypeId::Int32, ::opcua::ValueRank::Scalar, true, false);
   requireMissingNode(
       client,
       modelNodeId(namespace_index, {"components", port_component.getName(),
@@ -2702,8 +2864,8 @@ BOOST_FIXTURE_TEST_CASE(
   BOOST_TEST(
       !model.publishComponentSelected(component, forward, &error, &first));
   BOOST_TEST(error == "selective OPC UA publication rejected component '" +
-                          component.getName() + "' with 9 diagnostic(s)");
-  BOOST_REQUIRE_EQUAL(first.size(), 9U);
+                          component.getName() + "' with 8 diagnostic(s)");
+  BOOST_REQUIRE_EQUAL(first.size(), 8U);
   BOOST_TEST(std::ranges::count_if(first, [](const auto &diagnostic) {
                return diagnostic.kind ==
                       RTT::opcua::PublicationDiagnosticKind::malformed_selector;
@@ -2716,13 +2878,13 @@ BOOST_FIXTURE_TEST_CASE(
       std::ranges::count_if(first, [](const auto &diagnostic) {
         return diagnostic.kind ==
                RTT::opcua::PublicationDiagnosticKind::unsupported_resource;
-      }) == 7U);
+      }) == 6U);
   BOOST_TEST(
       !model.publishComponentSelected(component, reverse, &error, &second));
   BOOST_TEST(first == second, boost::test_tools::per_element());
   BOOST_TEST(model.componentCount() == 0U);
   BOOST_TEST(model.revision() == 0U);
-  BOOST_TEST(model.unsupportedResources(component.getName()).size() == 7U);
+  BOOST_TEST(model.unsupportedResources(component.getName()).size() == 6U);
 
   ::opcua::Client client;
   client.connect(server.endpointUrl());
@@ -2996,7 +3158,7 @@ BOOST_FIXTURE_TEST_CASE(rollback_never_deletes_a_reentrant_foreign_descendant,
   ReentrantRollbackComponent component(server, namespace_index, foreign_id);
   RTT::opcua::ObjectModel model(server);
   BOOST_TEST(!model.publishComponent(component, &error));
-  BOOST_TEST(error.find("intentional reentrant antiClone failure") !=
+  BOOST_TEST(error.find("intentional reentrant observation failure") !=
              std::string::npos);
   BOOST_TEST(model.componentCount() == 0U);
   BOOST_TEST(model.revision() == 0U);
@@ -3062,7 +3224,7 @@ BOOST_FIXTURE_TEST_CASE(rollback_never_deletes_a_reentrant_foreign_sole_child,
   ReentrantRollbackComponent component(server, namespace_index, foreign_id);
   RTT::opcua::ObjectModel model(server);
   BOOST_TEST(!model.publishComponent(component, &error));
-  BOOST_TEST(error.find("intentional reentrant antiClone failure") !=
+  BOOST_TEST(error.find("intentional reentrant observation failure") !=
              std::string::npos);
   BOOST_TEST(model.componentCount() == 0U);
   BOOST_TEST(model.revision() == 0U);
@@ -3147,7 +3309,7 @@ BOOST_FIXTURE_TEST_CASE(callback_failure_rolls_back_every_candidate_node,
   CallbackFailureComponent component;
   RTT::opcua::ObjectModel model(server);
   BOOST_TEST(!model.publishComponent(component, &error));
-  BOOST_TEST(error.find("intentional antiClone failure") != std::string::npos);
+  BOOST_TEST(error.find("intentional observation failure") != std::string::npos);
   BOOST_TEST(model.lastError() == error);
   BOOST_TEST(model.componentCount() == 0U);
   BOOST_TEST(model.revision() == 0U);
@@ -3207,7 +3369,7 @@ BOOST_FIXTURE_TEST_CASE(
   std::vector<RTT::opcua::PublicationDiagnostic> diagnostics;
   BOOST_TEST(!model.publishComponentSelected(
       failing, {"ports/ThrowingInput"}, &error, &diagnostics));
-  BOOST_TEST(error.find("intentional antiClone failure") != std::string::npos);
+  BOOST_TEST(error.find("intentional observation failure") != std::string::npos);
   BOOST_TEST(model.lastError() == error);
   BOOST_TEST(diagnostics.empty());
   BOOST_TEST(model.publicationDiagnostics(failing.getName()).empty());

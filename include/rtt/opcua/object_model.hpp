@@ -80,6 +80,16 @@ public:
       std::string *error = nullptr,
       std::vector<PublicationDiagnostic> *diagnostics = nullptr);
 
+  // Explicitly claim a whole input or fixed member/index region while its
+  // component is stopped. Accepted samples are acquired on the next cycle.
+  // Publication alone is read-only and does not claim any input regions.
+  bool enableInputWrite(RTT::TaskContext &component,
+                        const std::string &relative_endpoint,
+                        std::string *error = nullptr);
+  bool disableInputWrite(RTT::TaskContext &component,
+                         const std::string &relative_endpoint,
+                         std::string *error = nullptr);
+
   std::uint64_t revision() const noexcept;
   std::size_t componentCount() const noexcept;
   std::size_t pendingOperationCount() const noexcept;

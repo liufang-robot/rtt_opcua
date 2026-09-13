@@ -2,7 +2,7 @@
 
 #include "component_state.hpp"
 #include "operation_dispatcher.hpp"
-#include "port_bridge.hpp"
+#include <rtt/PortEndpoint.hpp>
 #include "publication_selector.hpp"
 
 #include <rtt/opcua/endpoint_type_registry.hpp>
@@ -204,115 +204,72 @@ private:
   bool writable_;
 };
 
-class InputPortValueDataSource final : public ::opcua::DataSourceBase {
+// Port callbacks run on the server thread. Source changes are dispatched to
+// that same thread; observation never creates a channel or reads working data.
+struct PortValueBinding {
+  RTT::PortEndpoint endpoint;
+  std::shared_ptr<RTT::PortObservation> observation;
+  std::shared_ptr<RTT::PortInputSource> source;
+};
+
+class PortValueDataSource final : public ::opcua::DataSourceBase {
 public:
-  InputPortValueDataSource(std::weak_ptr<ComponentState> state,
-                           std::shared_ptr<PortBridge> bridge)
-      : state_(std::move(state)), bridge_(std::move(bridge)) {}
+  PortValueDataSource(std::weak_ptr<ComponentState> state,
+                     std::shared_ptr<PortValueBinding> binding,
+                     std::shared_ptr<const EndpointTypeRegistry> registry,
+                     const TypeCodec *codec)
+      : state_(std::move(state)), binding_(std::move(binding)),
+        registry_(std::move(registry)), codec_(codec) {}
 
   ::opcua::StatusCode read(::opcua::Session &, const ::opcua::NodeId &,
-                           const ::opcua::NumericRange *range,
-                           ::opcua::DataValue &value, bool) override {
+                          const ::opcua::NumericRange *range,
+                          ::opcua::DataValue &value, bool) override {
     if (range != nullptr) {
       value.setStatus(UA_STATUSCODE_BADINDEXRANGEINVALID);
       return UA_STATUSCODE_BADINDEXRANGEINVALID;
     }
     ComponentLease lease(state_.lock());
-    if (!lease || !bridge_) {
+    if (!lease || !binding_->observation) {
       value.setStatus(UA_STATUSCODE_BADNOTCONNECTED);
       return UA_STATUSCODE_BADNOTCONNECTED;
     }
-    const std::lock_guard<std::mutex> lock(mutex_);
-    if (!has_last_value_) {
+    if (!binding_->observation->available()) {
       value.setStatus(UA_STATUSCODE_BADWAITINGFORINITIALDATA);
       return UA_STATUSCODE_BADWAITINGFORINITIALDATA;
     }
-    value.setValue(last_value_);
+    ::opcua::Variant encoded;
+    if (!codec_->toVariant(binding_->observation->snapshot(), &encoded)) {
+      value.setStatus(UA_STATUSCODE_BADTYPEMISMATCH);
+      return UA_STATUSCODE_BADTYPEMISMATCH;
+    }
+    value.setValue(std::move(encoded));
     return UA_STATUSCODE_GOOD;
   }
 
   ::opcua::StatusCode write(::opcua::Session &, const ::opcua::NodeId &,
-                            const ::opcua::NumericRange *range,
-                            const ::opcua::DataValue &value) override {
-    if (range != nullptr) {
-      return UA_STATUSCODE_BADINDEXRANGEINVALID;
-    }
-    if (!value.hasValue()) {
-      return UA_STATUSCODE_BADTYPEMISMATCH;
-    }
-    ComponentLease lease(state_.lock());
-    if (!lease || !bridge_) {
-      return UA_STATUSCODE_BADNOTCONNECTED;
-    }
-    const std::lock_guard<std::mutex> lock(mutex_);
-    const ::opcua::StatusCode status = bridge_->write(value.value());
-    if (status.isGood()) {
-      last_value_ = value.value();
-      has_last_value_ = true;
-    }
-    return status;
-  }
-
-private:
-  std::weak_ptr<ComponentState> state_;
-  std::shared_ptr<PortBridge> bridge_;
-  std::mutex mutex_;
-  ::opcua::Variant last_value_;
-  bool has_last_value_{false};
-};
-
-class OutputPortValueDataSource final : public ::opcua::DataSourceBase {
-public:
-  OutputPortValueDataSource(
-      std::weak_ptr<ComponentState> state, RTT::base::OutputPortInterface *port,
-      std::shared_ptr<const EndpointTypeRegistry> type_registry,
-      const TypeCodec *codec, std::shared_ptr<PortBridge> observer)
-      : state_(std::move(state)), port_(port),
-        type_registry_(std::move(type_registry)), codec_(codec),
-        observer_(std::move(observer)) {}
-
-  ::opcua::StatusCode read(::opcua::Session &, const ::opcua::NodeId &,
                            const ::opcua::NumericRange *range,
-                           ::opcua::DataValue &value, bool) override {
-    if (range != nullptr) {
-      value.setStatus(UA_STATUSCODE_BADINDEXRANGEINVALID);
-      return UA_STATUSCODE_BADINDEXRANGEINVALID;
-    }
+                           const ::opcua::DataValue &value) override {
+    if (range != nullptr) return UA_STATUSCODE_BADINDEXRANGEINVALID;
     ComponentLease lease(state_.lock());
-    if (!lease || port_ == nullptr) {
-      value.setStatus(UA_STATUSCODE_BADNOTCONNECTED);
-      return UA_STATUSCODE_BADNOTCONNECTED;
+    if (!lease) return UA_STATUSCODE_BADNOTCONNECTED;
+    if (!binding_->source) return UA_STATUSCODE_BADNOTWRITABLE;
+    if (!binding_->source->connected()) return UA_STATUSCODE_BADNOTCONNECTED;
+    if (!value.hasValue()) return UA_STATUSCODE_BADTYPEMISMATCH;
+    try {
+      auto sample = codec_->makeDataSource(value.value());
+      if (!sample) return UA_STATUSCODE_BADTYPEMISMATCH;
+      return binding_->source->stage(sample)
+          ? UA_STATUSCODE_GOOD : UA_STATUSCODE_BADRESOURCEUNAVAILABLE;
+    } catch (...) {
+      return UA_STATUSCODE_BADUNEXPECTEDERROR;
     }
-
-    ::opcua::Variant encoded;
-    switch (codec_ == nullptr ? PortValueStatus::error
-                              : codec_->portValue(port_, &encoded)) {
-    case PortValueStatus::value:
-      value.setValue(std::move(encoded));
-      return UA_STATUSCODE_GOOD;
-    case PortValueStatus::waiting_for_initial_data:
-      value.setStatus(UA_STATUSCODE_BADWAITINGFORINITIALDATA);
-      return UA_STATUSCODE_BADWAITINGFORINITIALDATA;
-    case PortValueStatus::error:
-      value.setStatus(UA_STATUSCODE_BADTYPEMISMATCH);
-      return UA_STATUSCODE_BADTYPEMISMATCH;
-    }
-    value.setStatus(UA_STATUSCODE_BADUNEXPECTEDERROR);
-    return UA_STATUSCODE_BADUNEXPECTEDERROR;
-  }
-
-  ::opcua::StatusCode write(::opcua::Session &, const ::opcua::NodeId &,
-                            const ::opcua::NumericRange *,
-                            const ::opcua::DataValue &) override {
-    return UA_STATUSCODE_BADNOTWRITABLE;
   }
 
 private:
   std::weak_ptr<ComponentState> state_;
-  RTT::base::OutputPortInterface *port_;
-  std::shared_ptr<const EndpointTypeRegistry> type_registry_;
+  std::shared_ptr<PortValueBinding> binding_;
+  std::shared_ptr<const EndpointTypeRegistry> registry_;
   const TypeCodec *codec_;
-  std::shared_ptr<PortBridge> observer_;
 };
 
 enum class NodeKind { object, variable, method };
@@ -323,6 +280,7 @@ struct CreatedNode {
 };
 
 struct NodeSpec {
+  std::shared_ptr<PortValueBinding> port_value;
   NodeKind kind;
   std::string path;
   std::string parent_path;
@@ -785,112 +743,43 @@ dataSourceSpec(const std::string &parent_path, const std::string &name,
   return spec;
 }
 
-NodeSpec
-inputPortValueSpec(const std::string &port_path,
-                   RTT::base::InputPortInterface &port,
-                   const std::shared_ptr<ComponentState> &state,
-                   std::shared_ptr<const EndpointTypeRegistry> type_registry) {
+NodeSpec portValueSpec(
+    const std::string &parent_path, const std::string &name,
+    RTT::PortEndpoint endpoint, const std::shared_ptr<ComponentState> &state,
+    std::shared_ptr<const EndpointTypeRegistry> type_registry) {
   NodeSpec spec;
   spec.kind = NodeKind::variable;
-  spec.parent_path = port_path;
-  spec.path = appendNodeSegment(port_path, "value");
-  spec.browse_name = "value";
-  spec.fingerprint = "input-port-value|" + pointerFingerprint(&port);
-  spec.create = [path = spec.path, parent = spec.parent_path, port = &port,
+  spec.parent_path = parent_path;
+  spec.path = appendNodeSegment(parent_path, name);
+  spec.browse_name = name;
+  spec.fingerprint = "port-value|" + pointerFingerprint(endpoint.port) +
+                     "|" + endpoint.member;
+  spec.port_value = std::make_shared<PortValueBinding>();
+  spec.port_value->endpoint = endpoint;
+  spec.create = [path = spec.path, parent = parent_path, name,
+                 binding = spec.port_value,
                  weak_state = std::weak_ptr<ComponentState>(state),
                  type_registry = std::move(type_registry)](
                     ::opcua::Server &server, std::uint16_t namespace_index,
                     bool *created, std::string *error) {
     ComponentLease lease(weak_state.lock());
-    if (!lease || port == nullptr || port->getTypeInfo() == nullptr) {
-      assignError(
-          error,
-          "RTT input port became unavailable while creating OPC UA value");
+    if (!lease) {
+      assignError(error, "RTT port became unavailable while creating OPC UA value");
       return false;
     }
-    const TypeCodec *codec =
-        type_registry ? type_registry->codecForTypeInfo(port->getTypeInfo())
-                      : nullptr;
+    const TypeCodec *codec = type_registry
+        ? type_registry->codecForTypeInfo(binding->endpoint.getTypeInfo())
+        : nullptr;
     if (codec == nullptr || !codec->hasValue()) {
-      assignError(error, "RTT input port type has no OPC UA protocol");
+      assignError(error, "RTT port region type has no OPC UA protocol");
       return false;
     }
-
-    std::string bridge_error;
-    const auto bridge = PortBridge::create(*port, type_registry, &bridge_error);
-    if (!bridge) {
-      assignError(error, std::move(bridge_error));
-      return false;
-    }
-
+    binding->observation = RTT::PortObservation::create(binding->endpoint, error);
+    if (!binding->observation) return false;
     ::opcua::VariableAttributes attributes;
-    attributes.setDisplayName(::opcua::LocalizedText("en-US", "value"));
+    attributes.setDisplayName(::opcua::LocalizedText("en-US", name));
     attributes.setDescription(::opcua::LocalizedText(
-        "en-US", "Write one sample to the RTT input port."));
-    attributes.setDataType(codec->dataTypeNodeId());
-    attributes.setValueRank(codec->valueRank());
-    if (codec->valueRank() == ::opcua::ValueRank::OneDimension) {
-      attributes.setArrayDimensions({0U});
-    }
-    attributes.setAccessLevel(readWriteAccess());
-    attributes.setUserAccessLevel(readWriteAccess());
-    const auto result = ::opcua::services::addVariable(
-        server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
-        "value", attributes, ::opcua::VariableTypeId::BaseDataVariableType,
-        ::opcua::ReferenceTypeId::HasComponent);
-    if (!componentNodeCreated(result, path, created, error)) {
-      return false;
-    }
-    ::opcua::setVariableNodeValueBackend(
-        server, nodeId(namespace_index, path),
-        std::make_unique<InputPortValueDataSource>(weak_state, bridge));
-    return true;
-  };
-  return spec;
-}
-
-NodeSpec
-outputPortValueSpec(const std::string &port_path,
-                    RTT::base::OutputPortInterface &port,
-                    const std::shared_ptr<ComponentState> &state,
-                    std::shared_ptr<const EndpointTypeRegistry> type_registry) {
-  NodeSpec spec;
-  spec.kind = NodeKind::variable;
-  spec.parent_path = port_path;
-  spec.path = appendNodeSegment(port_path, "value");
-  spec.browse_name = "value";
-  spec.fingerprint = "port-value|" + pointerFingerprint(&port);
-  spec.create = [path = spec.path, parent = spec.parent_path, port = &port,
-                 weak_state = std::weak_ptr<ComponentState>(state),
-                 type_registry = std::move(type_registry)](
-                    ::opcua::Server &server, std::uint16_t namespace_index,
-                    bool *created, std::string *error) {
-    ComponentLease lease(weak_state.lock());
-    if (!lease || port == nullptr || port->getTypeInfo() == nullptr) {
-      assignError(
-          error,
-          "RTT output port became unavailable while creating OPC UA value");
-      return false;
-    }
-    const TypeCodec *codec =
-        type_registry ? type_registry->codecForTypeInfo(port->getTypeInfo())
-                      : nullptr;
-    if (codec == nullptr || !codec->hasValue()) {
-      assignError(error, "RTT output port type has no OPC UA protocol");
-      return false;
-    }
-
-    std::string observer_error;
-    const auto observer = PortBridge::observe(*port, &observer_error);
-    if (!observer) {
-      assignError(error, std::move(observer_error));
-      return false;
-    }
-
-    ::opcua::VariableAttributes attributes;
-    attributes.setDisplayName(::opcua::LocalizedText("en-US", "value"));
-    attributes.setDescription(
-        ::opcua::LocalizedText("en-US", "Current RTT output-port value."));
+        "en-US", "Last component-acquired input or committed output image."));
     attributes.setDataType(codec->dataTypeNodeId());
     attributes.setValueRank(codec->valueRank());
     if (codec->valueRank() == ::opcua::ValueRank::OneDimension) {
@@ -900,15 +789,13 @@ outputPortValueSpec(const std::string &port_path,
     attributes.setUserAccessLevel(readOnlyAccess());
     const auto result = ::opcua::services::addVariable(
         server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
-        "value", attributes, ::opcua::VariableTypeId::BaseDataVariableType,
+        name, attributes, ::opcua::VariableTypeId::BaseDataVariableType,
         ::opcua::ReferenceTypeId::HasComponent);
-    if (!componentNodeCreated(result, path, created, error)) {
-      return false;
-    }
+    if (!componentNodeCreated(result, path, created, error)) return false;
     ::opcua::setVariableNodeValueBackend(
         server, nodeId(namespace_index, path),
-        std::make_unique<OutputPortValueDataSource>(
-            weak_state, port, type_registry, codec, observer));
+        std::make_unique<PortValueDataSource>(weak_state, binding,
+                                            type_registry, codec));
     return true;
   };
   return spec;
@@ -1481,13 +1368,9 @@ void appendPortBundle(
              staticStringSpec(appendNodeSegment(port_path, "description"),
                               port_path, "description", "RTT port description.",
                               port->getDescription()));
-  if (input != nullptr) {
-    insertNode(snapshot.nodes,
-               inputPortValueSpec(port_path, *input, state, type_registry));
-  } else {
-    insertNode(snapshot.nodes,
-               outputPortValueSpec(port_path, *output, state, type_registry));
-  }
+  insertNode(snapshot.nodes,
+             portValueSpec(port_path, "value", RTT::PortEndpoint{port, {}},
+                           state, type_registry));
 }
 
 void appendServiceBundle(ComponentSnapshot &snapshot,
@@ -1779,7 +1662,191 @@ public:
                                     diagnostic_output);
   }
 
+  bool enableInputWrite(RTT::TaskContext &component,
+                        const std::string &relative_endpoint,
+                        std::string *error) {
+    return configureInputWrite(component, relative_endpoint, true, error);
+  }
+
+  bool disableInputWrite(RTT::TaskContext &component,
+                         const std::string &relative_endpoint,
+                         std::string *error) {
+    return configureInputWrite(component, relative_endpoint, false, error);
+  }
+
 private:
+  bool configureInputWrite(RTT::TaskContext &component,
+                           const std::string &relative_endpoint, bool enable,
+                           std::string *error) {
+    std::unique_lock<std::mutex> lock(command_mutex);
+    if (admission_closed->load() || !server.isRunning())
+      return setFailure("OPC UA object model is unavailable", error);
+    const auto found = components.find(component.getName());
+    if (found == components.end() || found->second.component != &component)
+      return setFailure("input writing requires this component to be published",
+                        error);
+    RTT::PortEndpoint endpoint;
+    std::string failure;
+    if (!RTT::resolvePortEndpoint(*component.provides(), relative_endpoint,
+                                  endpoint, &failure))
+      return setFailure(std::move(failure), error);
+    if (!dynamic_cast<RTT::base::InputPortInterface *>(endpoint.port))
+      return setFailure("only input ports accept external samples", error);
+    if (!endpoint.port->connectionChangeAllowed())
+      return setFailure(
+          "input sources can only change while the component is stopped",
+          error);
+    auto &published = found->second;
+    auto whole = std::find_if(
+        published.nodes.begin(), published.nodes.end(), [&](const auto &entry) {
+          return entry.second.port_value &&
+                 entry.second.port_value->endpoint.port == endpoint.port &&
+                 entry.second.port_value->endpoint.member.empty();
+        });
+    if (whole == published.nodes.end())
+      return setFailure("input port is not in the published resource selection",
+                        error);
+    auto selected = std::find_if(
+        published.nodes.begin(), published.nodes.end(), [&](const auto &entry) {
+          return entry.second.port_value &&
+                 entry.second.port_value->endpoint.port == endpoint.port &&
+                 entry.second.port_value->endpoint.member == endpoint.member;
+        });
+    if (selected != published.nodes.end() &&
+        static_cast<bool>(selected->second.port_value->source) == enable &&
+        (!enable || selected->second.port_value->source->connected())) {
+      setSuccess(error);
+      return true;
+    }
+    if (!enable && selected == published.nodes.end()) {
+      setSuccess(error);
+      return true;
+    }
+    const TypeCodec *codec =
+        type_registry->codecForTypeInfo(endpoint.getTypeInfo());
+    if (!codec || !codec->hasValue())
+      return setFailure("input region type has no OPC UA protocol", error);
+    auto source =
+        enable ? RTT::PortInputSource::create(endpoint, &failure, "opcua")
+               : std::shared_ptr<RTT::PortInputSource>{};
+    if (enable && !source)
+      return setFailure(std::move(failure), error);
+    bool committed = false;
+    std::string invoke_error;
+    const bool invoked = server.invoke(
+        [&](::opcua::Server &native) {
+          const auto ns = server.namespaceIndex();
+          if (!ns) {
+            failure = "OPC UA namespace is unavailable";
+            return;
+          }
+          std::vector<CreatedNode> created_nodes;
+          NodeMap new_nodes;
+          std::optional<::opcua::NodeId> access_id;
+          ::opcua::Bitmask<::opcua::AccessLevel> previous_access;
+          bool access_changed = false;
+          try {
+            const bool ready = [&] {
+              if (selected == published.nodes.end()) {
+                const auto parent =
+                    appendNodeSegment(whole->second.parent_path, "members");
+                if (!published.nodes.contains(parent))
+                  new_nodes.emplace(
+                      parent,
+                      objectSpec(parent, whole->second.parent_path, "members",
+                                 "Selected typed port regions."));
+                auto spec = portValueSpec(parent, endpoint.member, endpoint,
+                                          published.state, type_registry);
+                new_nodes.emplace(spec.path, std::move(spec));
+                created_nodes.reserve(new_nodes.size());
+                for (const auto &[path, spec] : new_nodes) {
+                  // Allocate the ownership record before creating the native
+                  // node.
+                  CreatedNode record{nodeId(*ns, path), false};
+                  bool created = false;
+                  const bool added =
+                      createNode(native, *ns, spec, &created, &failure);
+                  if (created)
+                    created_nodes.push_back(std::move(record));
+                  if (!added)
+                    return false;
+                  if (!created) {
+                    failure = "input node creator did not report ownership";
+                    return false;
+                  }
+                }
+              }
+              NodeSpec &spec =
+                  selected != published.nodes.end()
+                      ? selected->second
+                      : new_nodes.at(appendNodeSegment(
+                            appendNodeSegment(whole->second.parent_path,
+                                              "members"),
+                            endpoint.member));
+              access_id.emplace(nodeId(*ns, spec.path));
+              const auto old_access =
+                  ::opcua::services::readAccessLevel(native, *access_id);
+              if (!old_access) {
+                failure = "failed to read input access: " +
+                          statusName(old_access.code());
+                return false;
+              }
+              previous_access = old_access.value();
+              const auto access = enable ? readWriteAccess() : readOnlyAccess();
+              // UserAccessLevel is computed from AccessLevel and the server
+              // access control policy; open62541 does not store or allow
+              // writing it separately.
+              const auto status = ::opcua::services::writeAccessLevel(
+                  native, *access_id, access);
+              if (status.isBad()) {
+                failure =
+                    "failed to update input access: " + statusName(status);
+                return false;
+              }
+              access_changed = true;
+              if (!enable && !spec.port_value->source->disconnect(&failure)) {
+                return false;
+              }
+              spec.port_value->source = std::move(source);
+              published.nodes.merge(new_nodes);
+              committed = true;
+              advanceRevision(native);
+              return true;
+            }();
+            if (ready)
+              return;
+          } catch (const std::exception &exception) {
+            failure = "input source configuration threw: " +
+                      std::string(exception.what());
+          } catch (...) {
+            failure = "input source configuration threw";
+          }
+          if (access_changed) {
+            const auto restored = ::opcua::services::writeAccessLevel(
+                native, *access_id, previous_access);
+            if (restored.isBad())
+              appendError(&failure, "failed to restore input access: " +
+                                        statusName(restored));
+          }
+          if (!created_nodes.empty()) {
+            std::string rollback_error;
+            if (!rollbackCreatedNodes(native, created_nodes, &rollback_error))
+              appendError(&failure,
+                          "input node rollback failed: " + rollback_error);
+          }
+        },
+        std::chrono::seconds(5), &invoke_error);
+    if (!invoked || !committed) {
+      if (source)
+        source->disconnect();
+      return setFailure(invoke_error.empty() ? std::move(failure)
+                                             : std::move(invoke_error),
+                        error);
+    }
+    setSuccess(error);
+    return true;
+  }
+
   bool publishComponentInternal(
       RTT::TaskContext &component, PublicationMode mode,
       const std::vector<std::string> &selectors, std::string *error,
@@ -2335,6 +2402,18 @@ bool ObjectModel::publishComponentSelected(
     std::string *error, std::vector<PublicationDiagnostic> *diagnostics) {
   return impl_->publishComponentSelected(component, selectors, error,
                                          diagnostics);
+}
+
+bool ObjectModel::enableInputWrite(RTT::TaskContext &component,
+                                   const std::string &relative_endpoint,
+                                   std::string *error) {
+  return impl_->enableInputWrite(component, relative_endpoint, error);
+}
+
+bool ObjectModel::disableInputWrite(RTT::TaskContext &component,
+                                    const std::string &relative_endpoint,
+                                    std::string *error) {
+  return impl_->disableInputWrite(component, relative_endpoint, error);
 }
 
 std::uint64_t ObjectModel::revision() const noexcept {

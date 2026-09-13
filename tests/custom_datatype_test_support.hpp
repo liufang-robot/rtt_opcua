@@ -8,7 +8,8 @@
 #include <rtt/OutputPort.hpp>
 #include <rtt/internal/DataSource.hpp>
 #include <rtt/internal/DataSources.hpp>
-#include <rtt/types/TemplateTypeInfo.hpp>
+#include <rtt/types/StructTypeInfo.hpp>
+#include <boost/serialization/nvp.hpp>
 #include <rtt/types/Types.hpp>
 
 #include <cstdint>
@@ -27,6 +28,10 @@ inline constexpr std::string_view kFixtureNamespaceUri =
 struct FixtureValue {
   std::int32_t count{0};
   double scale{0.0};
+
+  template<class Archive> void serialize(Archive &archive, unsigned) {
+    archive & BOOST_SERIALIZATION_NVP(count) & BOOST_SERIALIZATION_NVP(scale);
+  }
 
   auto operator<=>(const FixtureValue &) const = default;
 };
@@ -263,7 +268,7 @@ inline bool registerFixtureType(std::string *error = nullptr) {
       RTT::types::Types()->type(std::string(kFixtureTypeName));
   if (type_info == nullptr) {
     if (!RTT::types::Types()->addType(
-            new RTT::types::TemplateTypeInfo<FixtureValue, false>(
+            new RTT::types::StructTypeInfo<FixtureValue, false>(
                 std::string(kFixtureTypeName)))) {
       if (error != nullptr) {
         *error = "unable to register fixture RTT type";

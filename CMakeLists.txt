@@ -30,7 +30,6 @@ orocos_library(
   src/endpoint_type_registry.cpp
   src/object_model.cpp
   src/operation_dispatcher.cpp
-  src/port_bridge.cpp
   src/publication_selector.cpp
   src/remote_operation.cpp
   src/remote_port.cpp

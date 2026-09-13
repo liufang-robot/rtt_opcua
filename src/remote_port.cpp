@@ -52,6 +52,18 @@ RemotePortAdapter::create(std::shared_ptr<ClientSession> session,
     return {};
   }
   port->doc(description.description);
+  auto observation = codec->makeProxyDataSource(
+      [session, value_id = description.value_id](::opcua::Variant *value) {
+        auto result = session->readPortValue(value_id);
+        if (result.status != RemotePortReadStatus::value) return false;
+        *value = std::move(result.value);
+        return true;
+      });
+  if (!observation) {
+    assignError(error, "failed to construct remote port observation");
+    return {};
+  }
+  RTT::internal::PortDataAccess::setObservationSource(*port, observation);
   assignError(error, {});
   return std::shared_ptr<RemotePortAdapter>(
       new RemotePortAdapter(std::move(session), std::move(description),

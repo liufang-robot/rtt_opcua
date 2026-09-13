@@ -1,4 +1,5 @@
 #include <rtt/internal/PortDataAccess.hpp>
+#include <rtt/PortEndpoint.hpp>
 #define BOOST_TEST_MODULE rtt_opcua_task_context_proxy
 #include <boost/test/included/unit_test.hpp>
 
@@ -613,6 +614,7 @@ BOOST_FIXTURE_TEST_CASE(
   };
   BOOST_REQUIRE_MESSAGE(
       model.publishComponentSelected(target, selectors, &error), error);
+  BOOST_REQUIRE_MESSAGE(model.enableInputWrite(target, "Command", &error), error);
 
   ::opcua::Client client;
   client.connect(server.endpointUrl());
@@ -824,6 +826,7 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   ProxyTarget target;
   RTT::opcua::ObjectModel model(server);
   BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+  BOOST_REQUIRE_MESSAGE(model.enableInputWrite(target, "Command", &error), error);
 
   RTT::opcua::TaskContextProxyOptions proxy_options;
   proxy_options.request_timeout = std::chrono::milliseconds(500);
@@ -836,19 +839,10 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_TEST(proxy->connectionState() ==
              RTT::opcua::ProxyConnectionState::connected);
 
-  RTT::Service::shared_ptr feedback_service =
-      proxy->provides()->getService("Feedback");
-  RTT::Service::shared_ptr command_service =
-      proxy->provides()->getService("Command");
-  BOOST_REQUIRE(feedback_service);
-  BOOST_REQUIRE(command_service);
+  BOOST_TEST(!proxy->provides()->hasService("Feedback"));
+  BOOST_TEST(!proxy->provides()->hasService("Command"));
   BOOST_REQUIRE(proxy->ports()->getPort("Feedback") != nullptr);
   BOOST_REQUIRE(proxy->ports()->getPort("Command") != nullptr);
-  BOOST_REQUIRE(feedback_service->getOperation("snapshot") != nullptr);
-  BOOST_REQUIRE(command_service->getOperation("status") != nullptr);
-  BOOST_TEST(command_service->getOperation("read") == nullptr);
-  BOOST_TEST(command_service->getOperation("readNewest") == nullptr);
-  BOOST_TEST(feedback_service->getOperation("write") == nullptr);
 
   BOOST_TEST(proxy->isActive());
   BOOST_TEST(proxy->activate());
@@ -934,7 +928,7 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
       new RTT::internal::ConstantDataSource<std::int32_t>(40);
   BOOST_REQUIRE(RTT::internal::PortDataAccess::publish(*remote_feedback, filler) == RTT::WriteSuccess);
   // DATA delivery follows the remote state without a FIFO overflow/retry cycle.
-  BOOST_TEST(RTT::internal::PortDataAccess::publish(target.feedback, std::int32_t{41}) == RTT::WriteSuccess);
+  BOOST_TEST(RTT::internal::PortDataAccess::publish(target.feedback, std::int32_t{41}) == RTT::NotConnected);
   std::int32_t feedback_value = 0;
   BOOST_REQUIRE(waitUntil(
       [&] {
@@ -943,15 +937,12 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
       }));
   BOOST_TEST(feedback_value == 41);
 
-  std::int32_t generated_snapshot_value = 0;
-  RTT::OperationInterfacePart *generated_snapshot =
-      feedback_service->getOperation("snapshot");
-  RTT::internal::OperationCallerC generated_snapshot_caller(
-      generated_snapshot, "snapshot", RTT::internal::GlobalEngine::Instance());
-  generated_snapshot_caller.ret(generated_snapshot_value);
-  generated_snapshot_caller.check();
-  BOOST_REQUIRE(generated_snapshot_caller.call());
-  BOOST_TEST(generated_snapshot_value == 41);
+  auto feedback_observation = RTT::PortObservation::create({remote_feedback, ""}, &error);
+  BOOST_REQUIRE_MESSAGE(feedback_observation, error);
+  const auto feedback_source = RTT::internal::DataSource<std::int32_t>::narrow(
+      feedback_observation->dataSource().get());
+  BOOST_REQUIRE(feedback_source);
+  BOOST_TEST(feedback_source->get() == 41);
   RTT::InputPort<std::int32_t> initialized_feedback_sink(
       "InitializedFeedbackSink");
   BOOST_REQUIRE(remote_feedback->createConnection(
@@ -994,7 +985,7 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_REQUIRE(remote_feedback != nullptr);
   BOOST_REQUIRE(remote_feedback->createConnection(
       feedback_sink, RTT::ConnPolicy::data(RTT::ConnPolicy::LOCK_FREE, false)));
-  BOOST_TEST(RTT::internal::PortDataAccess::publish(target.feedback, std::int32_t{42}) == RTT::WriteSuccess);
+  BOOST_TEST(RTT::internal::PortDataAccess::publish(target.feedback, std::int32_t{42}) == RTT::NotConnected);
   BOOST_REQUIRE(waitUntil(
       [&] { return RTT::internal::PortDataAccess::receive(feedback_sink, feedback_value) == RTT::NewData; }));
   BOOST_TEST(feedback_value == 42);
@@ -1016,17 +1007,14 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   auto *remote_math_feedback = dynamic_cast<RTT::base::OutputPortInterface *>(
       math->getPort("MathFeedback"));
   BOOST_REQUIRE(remote_math_feedback != nullptr);
-  RTT::Service::shared_ptr math_feedback_service =
-      math->getService("MathFeedback");
-  BOOST_REQUIRE(math_feedback_service);
-  BOOST_REQUIRE(math_feedback_service->getOperation("snapshot") != nullptr);
+  BOOST_TEST(!math->hasService("MathFeedback"));
   BOOST_TEST(remote_math_feedback->getDescription() ==
              "Nested calculation feedback.");
   RTT::InputPort<std::int32_t> math_feedback_sink("MathFeedbackSink");
   BOOST_REQUIRE(remote_math_feedback->createConnection(
       math_feedback_sink,
       RTT::ConnPolicy::data(RTT::ConnPolicy::LOCK_FREE, false)));
-  BOOST_TEST(RTT::internal::PortDataAccess::publish(target.math_feedback, std::int32_t{84}) == RTT::WriteSuccess);
+  BOOST_TEST(RTT::internal::PortDataAccess::publish(target.math_feedback, std::int32_t{84}) == RTT::NotConnected);
   std::int32_t math_feedback_value = 0;
   BOOST_REQUIRE(waitUntil([&] {
     return RTT::internal::PortDataAccess::receive(math_feedback_sink, math_feedback_value) == RTT::NewData;
@@ -1259,9 +1247,9 @@ BOOST_FIXTURE_TEST_CASE(proxy_output_mirror_starts_with_latest_retained_value,
   ProxyTarget target;
   RTT::opcua::ObjectModel model(server);
   BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
-  BOOST_TEST(RTT::internal::PortDataAccess::publish(target.feedback, std::int32_t{1}) == RTT::WriteSuccess);
-  BOOST_TEST(RTT::internal::PortDataAccess::publish(target.feedback, std::int32_t{2}) == RTT::WriteSuccess);
-  BOOST_TEST(RTT::internal::PortDataAccess::publish(target.feedback, std::int32_t{3}) == RTT::WriteSuccess);
+  BOOST_TEST(RTT::internal::PortDataAccess::publish(target.feedback, std::int32_t{1}) == RTT::NotConnected);
+  BOOST_TEST(RTT::internal::PortDataAccess::publish(target.feedback, std::int32_t{2}) == RTT::NotConnected);
+  BOOST_TEST(RTT::internal::PortDataAccess::publish(target.feedback, std::int32_t{3}) == RTT::NotConnected);
 
   RTT::opcua::TaskContextProxyOptions options;
   options.request_timeout = std::chrono::milliseconds(500);
@@ -1285,6 +1273,64 @@ BOOST_FIXTURE_TEST_CASE(proxy_output_mirror_starts_with_latest_retained_value,
   server.stop();
 }
 
+BOOST_FIXTURE_TEST_CASE(proxy_observes_ports_without_local_channels,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions options;
+  options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  ProxyTarget target;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), {}, &error);
+  BOOST_REQUIRE_MESSAGE(proxy, error);
+  auto *remote_input = proxy->getPort("Command");
+  auto *remote_output = proxy->getPort("Feedback");
+  BOOST_REQUIRE(remote_input && remote_output);
+  BOOST_TEST((!remote_input->connected() && !remote_output->connected()));
+  BOOST_TEST((!target.command.connected() && !target.feedback.connected()));
+  auto input = RTT::PortObservation::create({remote_input, ""}, &error);
+  auto output = RTT::PortObservation::create({remote_output, ""}, &error);
+  BOOST_REQUIRE_MESSAGE(input && output, error);
+  BOOST_TEST(input->available());
+  BOOST_TEST(!output->available());
+  auto input_value = RTT::internal::DataSource<std::int32_t>::narrow(input->dataSource().get());
+  auto output_value = RTT::internal::DataSource<std::int32_t>::narrow(output->dataSource().get());
+  BOOST_REQUIRE(input_value && output_value);
+  BOOST_TEST(input_value->get() == 0);
+  BOOST_TEST((!input->dataSource()->isAssignable() && !output->dataSource()->isAssignable()));
+  RTT::internal::PortDataAccess::publish(target.feedback, std::int32_t{31});
+  BOOST_TEST(output->available());
+  BOOST_TEST(output_value->get() == 31);
+  target.feedback.data() = 99;
+  BOOST_TEST(output_value->get() == 31);
+  RTT::internal::PortDataAccess::publish(target.feedback, std::int32_t{37});
+  BOOST_TEST(output_value->get() == 37);
+
+  BOOST_REQUIRE_MESSAGE(model.enableInputWrite(target, "Command", &error), error);
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto input_id = modelNodeId(*server.namespaceIndex(),
+      {"components", target.getName(), "ports", "Command", "value"});
+  BOOST_REQUIRE(::opcua::services::writeValue(client, input_id,
+      ::opcua::Variant(std::int32_t{43})).isGood());
+  BOOST_TEST(input_value->get() == 0);
+  BOOST_TEST(target.command.data() == 0);
+  BOOST_TEST(RTT::internal::PortDataAccess::refresh(target.command) == RTT::NewData);
+  BOOST_TEST(input_value->get() == 43);
+  BOOST_TEST(target.command.status() == RTT::NewData);
+  BOOST_TEST(input_value->get() == 43);
+  BOOST_TEST(target.command.status() == RTT::NewData);
+  BOOST_TEST((!remote_input->connected() && !remote_output->connected()));
+  BOOST_REQUIRE_MESSAGE(model.disableInputWrite(target, "Command", &error), error);
+  BOOST_TEST(input_value->get() == 43);
+  client.disconnect();
+  proxy.reset();
+  server.stop();
+}
+
 BOOST_FIXTURE_TEST_CASE(proxy_includes_uncommitted_output,
                         CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;
@@ -1300,10 +1346,10 @@ BOOST_FIXTURE_TEST_CASE(proxy_includes_uncommitted_output,
       server.endpointUrl(), target.getName(), {}, &error);
   BOOST_REQUIRE_MESSAGE(proxy != nullptr, error);
   BOOST_TEST(proxy->ports()->getPort("Ephemeral") != nullptr);
-  RTT::Service::shared_ptr generated =
-      proxy->provides()->getService("Ephemeral");
-  BOOST_REQUIRE(generated);
-  BOOST_REQUIRE(generated->getOperation("snapshot") != nullptr);
+  BOOST_TEST(!proxy->provides()->hasService("Ephemeral"));
+  auto observation = RTT::PortObservation::create({proxy->getPort("Ephemeral"), ""}, &error);
+  BOOST_REQUIRE_MESSAGE(observation, error);
+  BOOST_TEST(!observation->available());
 
   proxy.reset();
   server.stop();
@@ -1321,6 +1367,7 @@ BOOST_FIXTURE_TEST_CASE(proxy_round_trips_an_endpoint_bound_custom_datatype,
   CustomProxyTarget target;
   RTT::opcua::ObjectModel model(server);
   BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+  BOOST_REQUIRE_MESSAGE(model.enableInputWrite(target, "Command", &error), error);
 
   RTT::opcua::TaskContextProxyOptions proxy_options;
   proxy_options.request_timeout = std::chrono::milliseconds(500);
@@ -1367,7 +1414,7 @@ BOOST_FIXTURE_TEST_CASE(proxy_round_trips_an_endpoint_bound_custom_datatype,
   RTT::InputPort<FixtureValue> feedback_sink("FeedbackSink");
   BOOST_REQUIRE(remote_feedback->createConnection(
       feedback_sink, RTT::ConnPolicy::data(RTT::ConnPolicy::LOCK_FREE, false)));
-  BOOST_TEST(RTT::internal::PortDataAccess::publish(target.feedback, FixtureValue{12, 6.5}) == RTT::WriteSuccess);
+  BOOST_TEST(RTT::internal::PortDataAccess::publish(target.feedback, FixtureValue{12, 6.5}) == RTT::NotConnected);
   FixtureValue feedback_value;
   BOOST_REQUIRE(waitUntil(
       [&] { return RTT::internal::PortDataAccess::receive(feedback_sink, feedback_value) == RTT::NewData; }));
@@ -1429,10 +1476,6 @@ BOOST_FIXTURE_TEST_CASE(
   BOOST_REQUIRE_MESSAGE(
       server.invoke(
           [&](::opcua::Server &native) {
-            removeCategories(
-                native, namespace_index,
-                {"components", component_name, "services", "Command"},
-                {"properties", "attributes", "ports", "services"});
             removeCategories(native, namespace_index,
                              {"components", component_name, "services", "math",
                               "services", "advanced"},
@@ -1454,8 +1497,7 @@ BOOST_FIXTURE_TEST_CASE(
   auto proxy = RTT::opcua::TaskContextProxy::create(
       server.endpointUrl(), target.getName(), proxy_options, &error);
   BOOST_REQUIRE_MESSAGE(proxy != nullptr, error);
-  BOOST_REQUIRE(proxy->provides()->getService("Command"));
-  BOOST_REQUIRE(proxy->provides()->getService("Command")->getOperation("status"));
+  BOOST_TEST(!proxy->provides()->hasService("Command"));
   BOOST_REQUIRE(proxy->provides()->getService("sparse_empty"));
   BOOST_TEST(proxy->provides()->getService("sparse_empty")->doc() ==
              "Intentionally sparse empty service.");
