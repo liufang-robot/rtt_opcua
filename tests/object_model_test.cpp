@@ -504,7 +504,7 @@ public:
     addConstant("ModelName", model_name);
     addPort(feedback).doc("Measured feedback");
     addPort(command).doc("Requested command");
-    addEventPort(trigger).doc("External trigger");
+    addPort(trigger).doc("Requested trigger state");
     motion->addProperty("Scale", scale).doc("Motion scale");
     motion->addAttribute("Mode", motion_mode);
     motion->addConstant("Units", motion_units);
