@@ -926,20 +926,21 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_TEST(remote_feedback->getDescription() == "Calculated feedback.");
   RTT::InputPort<std::int32_t> feedback_sink("FeedbackSink");
   RTT::ConnPolicy feedback_policy =
-      RTT::ConnPolicy::buffer(1, RTT::ConnPolicy::LOCK_FREE, false);
+      RTT::ConnPolicy::data(RTT::ConnPolicy::LOCK_FREE, false);
   feedback_policy.mandatory = true;
   BOOST_REQUIRE(
       remote_feedback->createConnection(feedback_sink, feedback_policy));
   const RTT::base::DataSourceBase::shared_ptr filler =
       new RTT::internal::ConstantDataSource<std::int32_t>(40);
   BOOST_REQUIRE(RTT::internal::PortDataAccess::publish(*remote_feedback, filler) == RTT::WriteSuccess);
+  // DATA delivery follows the remote state without a FIFO overflow/retry cycle.
   BOOST_TEST(RTT::internal::PortDataAccess::publish(target.feedback, std::int32_t{41}) == RTT::WriteSuccess);
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
   std::int32_t feedback_value = 0;
-  BOOST_REQUIRE(RTT::internal::PortDataAccess::receive(feedback_sink, feedback_value) == RTT::NewData);
-  BOOST_TEST(feedback_value == 40);
   BOOST_REQUIRE(waitUntil(
-      [&] { return RTT::internal::PortDataAccess::receive(feedback_sink, feedback_value) == RTT::NewData; }));
+      [&] {
+        return RTT::internal::PortDataAccess::receive(feedback_sink, feedback_value) == RTT::NewData &&
+               feedback_value == 41;
+      }));
   BOOST_TEST(feedback_value == 41);
 
   std::int32_t generated_snapshot_value = 0;

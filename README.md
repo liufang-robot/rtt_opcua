@@ -4,6 +4,12 @@
 the supported interface of an RTT `TaskContext` and can construct a remote RTT
 proxy from that model. The implementation uses open62541 through open62541pp.
 
+The ConnPolicy codec accepts DATA and the output-stream-only UNBUFFERED kind.
+Removed FIFO/circular-buffer kinds and unknown numeric kinds are rejected on
+encoding and decoding. Rejected incoming policies leave the last decoded proxy
+value intact; requests are never silently converted to latest-value delivery. The `size`
+field remains available for transport capacity, independently of data-port mode.
+
 Network input samples are staged in transport-owned channels and acquired at the
 component's next cyclic input boundary. Output values observe committed snapshots;
 editing an output working image does not publish it. Component scripting services
