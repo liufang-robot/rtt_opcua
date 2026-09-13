@@ -450,7 +450,7 @@ public:
       return PortValueStatus::error;
     }
     T sample{};
-    if (!typed->getLastWrittenValue(sample)) {
+    if (!typed->snapshot(sample)) {
       return PortValueStatus::waiting_for_initial_data;
     }
     if (!isValidScalarValue<T, Wire>(sample)) {
@@ -535,7 +535,7 @@ public:
       return PortValueStatus::error;
     }
     Value sample;
-    if (!typed->getLastWrittenValue(sample)) {
+    if (!typed->snapshot(sample)) {
       return PortValueStatus::waiting_for_initial_data;
     }
     *value = ::opcua::Variant(std::move(sample));

@@ -284,11 +284,10 @@ bool validatePortValue(::opcua::Client &client,
     return false;
   }
 
-  const bool readable = true;
-  const bool writable = port.direction == PortDirection::input;
-  const auto accessMatches = [readable, writable](const auto &level) {
-    return level.anyOf(::opcua::AccessLevel::CurrentRead) == readable &&
-           level.anyOf(::opcua::AccessLevel::CurrentWrite) == writable;
+  const auto accessMatches = [&port](const auto &level) {
+    return level.anyOf(::opcua::AccessLevel::CurrentRead) &&
+           (port.direction == PortDirection::input ||
+            !level.anyOf(::opcua::AccessLevel::CurrentWrite));
   };
   const bool valid = node_class.value() == ::opcua::NodeClass::Variable &&
                      data_type.value() == codec->dataTypeNodeId() &&

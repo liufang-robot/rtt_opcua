@@ -4,13 +4,44 @@
 the supported interface of an RTT `TaskContext` and can construct a remote RTT
 proxy from that model. The implementation uses open62541 through open62541pp.
 
+The ConnPolicy codec accepts DATA and the output-stream-only UNBUFFERED kind.
+Removed FIFO/circular-buffer kinds and unknown numeric kinds are rejected on
+encoding and decoding. Rejected incoming policies leave the last decoded proxy
+value intact; requests are never silently converted to latest-value delivery. The `size`
+field remains available for transport capacity, independently of data-port mode.
+
+Publishing a component only observes its ports and creates no RTT connections.
+Input values show configured defaults and then the last component-acquired image;
+output values show the last committed publication. Output reads wait for the
+first commit. There are no generated RTT port services or snapshot operations.
+
+External writes require explicit stopped configuration after publication:
+
+```cpp
+model.enableInputWrite(component, "command", &error);       // whole input
+model.enableInputWrite(component, "motion.target.x", &error); // selected member
+```
+
+A whole source makes `ports/command/value` writable. A selected source creates
+`ports/target/members/x` below its service; nested selectors and fixed indices
+use one percent-escaped member segment. Writes supply the exact selected type,
+stage a sample, and become visible to reads only after component acquisition.
+Overlapping local/network writers are rejected; outputs remain read-only.
+`disableInputWrite(component, endpoint, &error)` releases the source while stopped
+and keeps any selected Variable as read-only observation. NumericRange access is
+not supported; use typed selected Variables.
+
+Remote mirrors preserve channel transfers and pending samples across reconnects.
+Their passive observation reads the remote value independently of local channel
+connections, so TaskBrowser can inspect `component.output.y` directly.
+
 The package is generic transport infrastructure. The OPC UA deployment
 component, `deployer-opcua-<target>`, and `ctaskbrowser-opcua-<target>` are
 provided by OCL.
 
 ## Current Scope
 
-- C++20
+- C++20 and RTT 3.0 or newer
 - open62541pp 0.21.2 or newer within the 0.21 API series
 - server binding restricted to `127.0.0.1`, `::1`, or the explicit IPv4
   wildcard `0.0.0.0`
